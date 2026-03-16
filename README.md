@@ -30,25 +30,49 @@ docker run --rm -v /path/to/repo:/workspace vibe-check /workspace
 ### Reviewing a PR
 
 ```bash
-# Grade the base branch
-git checkout main
-docker run --rm -v $(pwd):/workspace vibe-check /workspace > base-report.md
+# Automatic — pass a GitHub PR URL (requires gh CLI)
+docker run --rm vibe-check --pr https://github.com/org/repo/pull/123
 
-# Grade the PR branch
-git checkout feature-branch
-docker run --rm -v $(pwd):/workspace vibe-check /workspace > pr-report.md
+# Manual — specify base and head refs
+docker run --rm vibe-check --compare main...feature-branch https://github.com/org/repo
 
-# Compare — did the PR improve or degrade quality?
-diff base-report.md pr-report.md
+# Local repo comparison
+docker run --rm -v $(pwd):/workspace vibe-check --compare main...feature-branch /workspace
 ```
 
-Automated PR mode (run both, diff scores, post as PR comment) is planned — see [issue #3](https://github.com/nexus-marbell/vibe-check/issues/3).
+PR mode checks out both refs, runs full analysis on each, and outputs a delta report:
+
+```
+# vibe-check: PR Delta — repo-name
+Base: main (abc123) | Head: feature-branch (def456)
+Overall: B (80) → C (65) ▼ (-15)
+
+## Dimension Changes
+| Dimension | Base | Head | Delta |
+|-----------|------|------|-------|
+| Linting | A (95) | C (62) | -33 ▼ |
+| Complexity | B (80) | B (78) | -2 ▼ |
+
+## New Risk Flags
+- High lint issue count (47) [NEW]
+```
+
+### Private repos
+
+Pass a GitHub token for private repo access:
+
+```bash
+docker run --rm -e GH_TOKEN=ghp_xxx vibe-check https://github.com/org/private-repo
+docker run --rm -e GH_TOKEN=ghp_xxx vibe-check --pr https://github.com/org/private-repo/pull/42
+```
 
 ### Local (partial — only runs tools you have installed)
 
 ```bash
 python vibe_check.py https://github.com/org/repo
 python vibe_check.py /path/to/local/repo
+python vibe_check.py --pr https://github.com/org/repo/pull/123
+python vibe_check.py --compare main...feature-branch /path/to/local/repo
 ```
 
 Missing tools are skipped gracefully. Docker is the intended workflow — all tools are pre-installed in the image.
