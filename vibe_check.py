@@ -550,7 +550,6 @@ def stage_eslint(repo: Path, report: ReportData) -> None:
     for file_result in data:
         if isinstance(file_result, dict):
             count += file_result.get("errorCount", 0)
-            count += file_result.get("warningCount", 0)
 
     if count == 0:
         score = 100
