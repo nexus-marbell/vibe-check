@@ -2,15 +2,20 @@
 """vibe-check: Code quality aggregator that makes auditable intent visible.
 
 Takes a git repo URL (or local path), runs static analysis tools,
-and produces a graded markdown report.
+and produces a graded markdown report. Supports full-repo mode,
+PR mode (via GitHub URL), and manual ref comparison.
 
 Usage:
     python vibe_check.py https://github.com/org/repo
     python vibe_check.py /path/to/local/repo
+    python vibe_check.py --pr https://github.com/org/repo/pull/123
+    python vibe_check.py --compare main...feature-branch https://github.com/org/repo
+    python vibe_check.py --compare main...feature-branch /path/to/local/repo
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -1048,17 +1053,387 @@ def render_report(report: ReportData) -> str:
     return "\n".join(lines)
 
 
+# -- Analysis pipeline --------------------------------------------------------
+
+
+def _run_analysis(repo_path: Path, repo_name: str, commit_sha: str, commit_date: str) -> ReportData:
+    """Run the full analysis pipeline on a repo path.
+
+    This is the single entry point for running all stages and computing
+    the overall grade. Used by both full-repo mode and PR comparison mode.
+    """
+    report = ReportData(
+        repo_name=repo_name,
+        commit_sha=commit_sha,
+        commit_date=commit_date,
+    )
+
+    languages = detect_languages(repo_path)
+    if not languages:
+        print(
+            "WARNING: No Python or TypeScript files detected. "
+            "Running Python toolchain as fallback.",
+            file=sys.stderr,
+        )
+        languages = {"python"}
+
+    if "python" in languages:
+        stage_ruff(repo_path, report)
+    if "typescript" in languages:
+        stage_eslint(repo_path, report)
+
+    if "python" in languages:
+        stage_pyright(repo_path, report)
+    if "typescript" in languages:
+        stage_tsc(repo_path, report)
+
+    stage_complexity(repo_path, report)
+
+    if "python" in languages:
+        stage_health(repo_path, report)
+
+    if "python" in languages:
+        stage_duplication(repo_path, report)
+    if "typescript" in languages:
+        stage_jscpd(repo_path, report)
+
+    stage_wily(repo_path, report)
+    stage_hygiene(repo_path, report)
+    compute_overall(report)
+
+    return report
+
+
+# -- Delta report -------------------------------------------------------------
+
+
+def _direction_arrow(delta: float) -> str:
+    """Return a direction arrow for a score delta."""
+    if delta > 0:
+        return "^"
+    if delta < 0:
+        return "v"
+    return "="
+
+
+def _diff_reports(base: ReportData, head: ReportData) -> str:
+    """Compare two reports and produce a delta markdown report.
+
+    Shows overall grade change, per-dimension deltas, new risk flags,
+    new auto-F triggers, and new complexity hotspots.
+    """
+    lines: list[str] = []
+    lines.append(f"# vibe-check: PR Delta -- {head.repo_name}")
+    lines.append(
+        f"**Base**: {base.commit_sha} | **Head**: {head.commit_sha}"
+    )
+
+    base_grade_str = f"{base.overall_grade} ({base.overall_score:.0f})"
+    head_grade_str = f"{head.overall_grade} ({head.overall_score:.0f})"
+    delta_overall = head.overall_score - base.overall_score
+    arrow = _direction_arrow(delta_overall)
+    lines.append(
+        f"**Overall**: {base_grade_str} -> {head_grade_str} "
+        f"{arrow} ({delta_overall:+.0f})"
+    )
+    lines.append("")
+
+    # Per-dimension delta table
+    lines.append("## Dimension Changes")
+    lines.append("| Dimension | Base | Head | Delta |")
+    lines.append("|-----------|------|------|-------|")
+
+    base_dims = {d.name: d for d in base.dimensions}
+    head_dims = {d.name: d for d in head.dimensions}
+    all_dim_names = list(dict.fromkeys(
+        [d.name for d in base.dimensions] + [d.name for d in head.dimensions]
+    ))
+
+    for name in all_dim_names:
+        b = base_dims.get(name)
+        h = head_dims.get(name)
+        if b and h:
+            delta = h.score - b.score
+            arr = _direction_arrow(delta)
+            lines.append(
+                f"| {name} | {b.grade} ({b.score:.0f}) "
+                f"| {h.grade} ({h.score:.0f}) | {delta:+.0f} {arr} |"
+            )
+        elif h:
+            lines.append(f"| {name} | -- | {h.grade} ({h.score:.0f}) | NEW |")
+        elif b:
+            lines.append(f"| {name} | {b.grade} ({b.score:.0f}) | -- | REMOVED |")
+
+    lines.append("")
+
+    # New risk flags
+    base_flags = set(base.risk_flags)
+    new_flags = [f for f in head.risk_flags if f not in base_flags]
+    if new_flags:
+        lines.append("## New Risk Flags")
+        for flag in new_flags:
+            lines.append(f"- {flag} [NEW]")
+        lines.append("")
+
+    # Resolved risk flags
+    head_flags = set(head.risk_flags)
+    resolved_flags = [f for f in base.risk_flags if f not in head_flags]
+    if resolved_flags:
+        lines.append("## Resolved Risk Flags")
+        for flag in resolved_flags:
+            lines.append(f"- {flag} [RESOLVED]")
+        lines.append("")
+
+    # New auto-F triggers
+    base_triggers = set(base.auto_f_triggers)
+    new_triggers = [t for t in head.auto_f_triggers if t not in base_triggers]
+    if new_triggers:
+        lines.append("## New Auto-F Triggers")
+        for trigger in new_triggers:
+            lines.append(f"- {trigger} [NEW]")
+        lines.append("")
+
+    # New complexity hotspots
+    base_hotspot_keys = {(h.file, h.function) for h in base.hotspots}
+    new_hotspots = [
+        h for h in head.hotspots if (h.file, h.function) not in base_hotspot_keys
+    ]
+    if new_hotspots:
+        lines.append("## New Complexity Hotspots")
+        for h in new_hotspots:
+            short_file = Path(h.file).name
+            lines.append(f"- {short_file}:{h.function} CC={h.cc} [NEW]")
+        lines.append("")
+
+    # Resolved hotspots
+    head_hotspot_keys = {(h.file, h.function) for h in head.hotspots}
+    resolved_hotspots = [
+        h for h in base.hotspots if (h.file, h.function) not in head_hotspot_keys
+    ]
+    if resolved_hotspots:
+        lines.append("## Resolved Complexity Hotspots")
+        for h in resolved_hotspots:
+            short_file = Path(h.file).name
+            lines.append(f"- {short_file}:{h.function} CC={h.cc} [RESOLVED]")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# -- PR URL parsing -----------------------------------------------------------
+
+
+def _parse_pr_url(url: str) -> tuple[str, str, int]:
+    """Extract owner, repo, and PR number from a GitHub PR URL.
+
+    Accepts URLs like:
+        https://github.com/org/repo/pull/123
+        https://github.com/org/repo/pull/123/files
+
+    Raises ValueError if the URL does not match the expected format.
+    """
+    match = re.match(
+        r"https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)", url
+    )
+    if not match:
+        raise ValueError(
+            f"Invalid PR URL: {url}\n"
+            "Expected format: https://github.com/owner/repo/pull/123"
+        )
+    return match.group(1), match.group(2), int(match.group(3))
+
+
+def _resolve_pr_refs(pr_url: str) -> tuple[str, str, str, str]:
+    """Resolve a PR URL to (repo_url, base_ref, head_ref, repo_slug).
+
+    Uses `gh pr view` to get the base and head ref names.
+    Raises RuntimeError if `gh` is not available or the command fails.
+    """
+    owner, repo, number = _parse_pr_url(pr_url)
+    repo_slug = f"{owner}/{repo}"
+
+    result = _run(
+        [
+            "gh", "pr", "view", str(number),
+            "--repo", repo_slug,
+            "--json", "baseRefName,headRefName",
+        ]
+    )
+
+    if result.returncode == 127:
+        raise RuntimeError(
+            "gh CLI not found. Install it from https://cli.github.com/ or "
+            "use --compare BASE_REF...HEAD_REF instead."
+        )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh pr view failed for {repo_slug}#{number}: "
+            f"{result.stderr.strip()}"
+        )
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse gh output: {exc}") from exc
+
+    base_ref = data.get("baseRefName", "")
+    head_ref = data.get("headRefName", "")
+    if not base_ref or not head_ref:
+        raise RuntimeError(
+            f"Could not determine refs for {repo_slug}#{number}. "
+            f"gh returned: {data}"
+        )
+
+    repo_url = f"https://github.com/{repo_slug}"
+    return repo_url, base_ref, head_ref, repo_slug
+
+
+# -- Comparison mode ----------------------------------------------------------
+
+
+def _checkout_ref(repo_path: Path, ref: str) -> tuple[str, str]:
+    """Checkout a git ref and return (short_sha, date)."""
+    fetch = _run(["git", "fetch", "origin", ref], cwd=repo_path)
+    if fetch.returncode != 0:
+        # Might be a local branch or tag, try checkout directly
+        pass
+
+    checkout = _run(["git", "checkout", ref], cwd=repo_path)
+    if checkout.returncode != 0:
+        # Try as remote tracking branch
+        checkout = _run(["git", "checkout", f"origin/{ref}"], cwd=repo_path)
+        if checkout.returncode != 0:
+            raise RuntimeError(
+                f"Failed to checkout ref '{ref}': {checkout.stderr.strip()}"
+            )
+
+    log = _run(["git", "log", "-1", "--format=%H|%ci"], cwd=repo_path)
+    if log.returncode == 0 and "|" in log.stdout.strip():
+        sha, date = log.stdout.strip().split("|", 1)
+        return sha[:12], date.split(" ")[0]
+    return "unknown", "unknown"
+
+
+def compare_refs(
+    target: str, base_ref: str, head_ref: str, repo_slug: str = "",
+) -> None:
+    """Clone/resolve a repo, analyze base and head refs, print delta report.
+
+    This is the core comparison logic used by both --pr and --compare modes.
+    """
+    is_remote = target.startswith(("http://", "https://", "git@"))
+    if is_remote:
+        workspace = (
+            _WORKSPACE if _WORKSPACE.parent.exists() else Path(tempfile.mkdtemp())
+        )
+        clone_url = _inject_token(target)
+        result = _run(["git", "clone", clone_url, str(workspace)])
+        if result.returncode != 0:
+            raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
+        repo_path = workspace
+        repo_name = repo_slug or target.rstrip("/").split("/")[-1].removesuffix(".git")
+    else:
+        repo_path = Path(target).resolve()
+        if not repo_path.is_dir():
+            raise RuntimeError(f"Local path not found: {target}")
+        repo_name = repo_slug or repo_path.name
+
+    # Analyze base ref
+    print(f"Checking out base ref: {base_ref}", file=sys.stderr)
+    base_sha, base_date = _checkout_ref(repo_path, base_ref)
+    print(f"Analyzing base ({base_ref} @ {base_sha})...", file=sys.stderr)
+    base_report = _run_analysis(repo_path, repo_name, base_sha, base_date)
+
+    # Analyze head ref
+    print(f"Checking out head ref: {head_ref}", file=sys.stderr)
+    head_sha, head_date = _checkout_ref(repo_path, head_ref)
+    print(f"Analyzing head ({head_ref} @ {head_sha})...", file=sys.stderr)
+    head_report = _run_analysis(repo_path, repo_name, head_sha, head_date)
+
+    # Produce delta report
+    delta = _diff_reports(base_report, head_report)
+    print(delta)
+
+
+# -- CLI argument parsing -----------------------------------------------------
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the argparse parser for vibe-check."""
+    parser = argparse.ArgumentParser(
+        prog="vibe_check",
+        description="Code quality aggregator. Analyzes repos and produces graded reports.",
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        help="Repository URL or local path to analyze (full-repo mode).",
+    )
+    parser.add_argument(
+        "--pr",
+        metavar="PR_URL",
+        help="GitHub PR URL to analyze (e.g., https://github.com/org/repo/pull/123).",
+    )
+    parser.add_argument(
+        "--compare",
+        metavar="BASE...HEAD",
+        help="Compare two refs (e.g., main...feature-branch). Requires target.",
+    )
+    return parser
+
+
 # -- Main ----------------------------------------------------------------------
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: vibe_check.py <repo-url-or-path>", file=sys.stderr)
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    # PR mode
+    if args.pr:
+        try:
+            repo_url, base_ref, head_ref, repo_slug = _resolve_pr_refs(args.pr)
+        except (ValueError, RuntimeError) as exc:
+            print(f"FATAL: {exc}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            compare_refs(repo_url, base_ref, head_ref, repo_slug)
+        except RuntimeError as exc:
+            print(f"FATAL: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Compare mode
+    if args.compare:
+        if not args.target:
+            print(
+                "FATAL: --compare requires a target (repo URL or local path).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        parts = args.compare.split("...")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            print(
+                f"FATAL: Invalid compare format: {args.compare}\n"
+                "Expected: BASE_REF...HEAD_REF (e.g., main...feature-branch)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        base_ref, head_ref = parts
+        try:
+            compare_refs(args.target, base_ref, head_ref)
+        except RuntimeError as exc:
+            print(f"FATAL: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Full-repo mode (default)
+    if not args.target:
+        parser.print_help(sys.stderr)
         sys.exit(1)
 
-    target = sys.argv[1]
+    target = args.target
 
-    # Determine workspace
     if target.startswith(("http://", "https://", "git@")):
         workspace = (
             _WORKSPACE if _WORKSPACE.parent.exists() else Path(tempfile.mkdtemp())
@@ -1066,61 +1441,13 @@ def main() -> None:
     else:
         workspace = Path(target).resolve()
 
-    report = ReportData()
-
-    # Stage 1: Clone / identify
     try:
-        repo_path, report.repo_name, report.commit_sha, report.commit_date = (
-            stage_clone(target, workspace)
-        )
+        repo_path, repo_name, commit_sha, commit_date = stage_clone(target, workspace)
     except RuntimeError as exc:
         print(f"FATAL: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Stage 2: Detect languages
-    languages = detect_languages(repo_path)
-    if not languages:
-        print(
-            "WARNING: No Python or TypeScript files detected. Running Python toolchain as fallback.",
-            file=sys.stderr,
-        )
-        languages = {"python"}
-
-    # Stage 3: Lint
-    if "python" in languages:
-        stage_ruff(repo_path, report)
-    if "typescript" in languages:
-        stage_eslint(repo_path, report)
-
-    # Stage 4: Type check
-    if "python" in languages:
-        stage_pyright(repo_path, report)
-    if "typescript" in languages:
-        stage_tsc(repo_path, report)
-
-    # Stage 5: Complexity (lizard supports both, radon is Python-only)
-    stage_complexity(repo_path, report)
-
-    # Stage 6: Health (pyscn -- Python only)
-    if "python" in languages:
-        stage_health(repo_path, report)
-
-    # Stage 7: Duplication
-    if "python" in languages:
-        stage_duplication(repo_path, report)
-    if "typescript" in languages:
-        stage_jscpd(repo_path, report)
-
-    # Stage 8: History (wily) -- informational, no dimension
-    stage_wily(repo_path, report)
-
-    # Stage 9: Hygiene (license, tests, README, .gitignore, secrets)
-    stage_hygiene(repo_path, report)
-
-    # Compute overall grade (includes auto-F trigger check)
-    compute_overall(report)
-
-    # Output
+    report = _run_analysis(repo_path, repo_name, commit_sha, commit_date)
     print(render_report(report))
 
 
