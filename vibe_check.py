@@ -95,6 +95,37 @@ def _score_to_grade(score: float) -> str:
 # -- Language Detection --------------------------------------------------------
 
 
+def _has_python_markers(repo: Path) -> bool:
+    """Check for Python project markers or .py source files."""
+    config_markers = ["pyproject.toml", "setup.py", "setup.cfg"]
+    for marker in config_markers:
+        if (repo / marker).exists():
+            return True
+
+    py_files = [
+        f
+        for f in repo.rglob("*.py")
+        if ".git" not in f.parts and "node_modules" not in f.parts
+    ]
+    return len(py_files) > 0
+
+
+def _has_typescript_markers(repo: Path) -> bool:
+    """Check for TypeScript project markers or .ts/.tsx source files."""
+    if (repo / "tsconfig.json").exists():
+        return True
+
+    if (repo / "package.json").exists():
+        return True
+
+    ts_files = [
+        f
+        for f in list(repo.rglob("*.ts")) + list(repo.rglob("*.tsx"))
+        if ".git" not in f.parts and "node_modules" not in f.parts
+    ]
+    return len(ts_files) > 0
+
+
 def detect_languages(repo: Path) -> set[str]:
     """Detect programming languages in a repository.
 
@@ -103,46 +134,11 @@ def detect_languages(repo: Path) -> set[str]:
     """
     languages: set[str] = set()
 
-    python_markers = ["pyproject.toml", "setup.py", "setup.cfg"]
-    ts_markers = ["tsconfig.json"]
-    ts_package_markers = ["package.json"]
+    if _has_python_markers(repo):
+        languages.add("python")
 
-    for marker in python_markers:
-        if (repo / marker).exists():
-            languages.add("python")
-            break
-
-    if "python" not in languages:
-        py_files = list(repo.rglob("*.py"))
-        # Exclude common non-project files
-        py_files = [
-            f
-            for f in py_files
-            if ".git" not in f.parts and "node_modules" not in f.parts
-        ]
-        if py_files:
-            languages.add("python")
-
-    for marker in ts_markers:
-        if (repo / marker).exists():
-            languages.add("typescript")
-            break
-
-    if "typescript" not in languages:
-        for marker in ts_package_markers:
-            if (repo / marker).exists():
-                languages.add("typescript")
-                break
-
-    if "typescript" not in languages:
-        ts_files = list(repo.rglob("*.ts")) + list(repo.rglob("*.tsx"))
-        ts_files = [
-            f
-            for f in ts_files
-            if ".git" not in f.parts and "node_modules" not in f.parts
-        ]
-        if ts_files:
-            languages.add("typescript")
+    if _has_typescript_markers(repo):
+        languages.add("typescript")
 
     return languages
 
@@ -481,23 +477,11 @@ def _is_dunder_pair(func1: str, func2: str) -> bool:
     return func1 in dunders and func2 in dunders
 
 
-def stage_duplication(repo: Path, report: ReportData) -> None:
-    """Run deepcsim for structural duplication detection."""
-    result = _run(["deepcsim-cli", str(repo), "--threshold", "80", "--json"])
-    if result.returncode == 127:
-        report.tool_errors.append("deepcsim-cli: not installed")
-        report.dimensions.append(DimensionResult("Duplication", "skipped", "?", 50))
-        return
-
-    summary_lines: list[str] = []
-
-    # deepcsim JSON: {"count": N, "results": [{file1, file2, similarity: float, ...}]}
-    # Each result is a file pair. The top-level "similarity" is a float (overall).
-    # Each comparison within has similarity as a dict {structural, semantic, ...}.
-    data = _parse_deepcsim_json(result.stdout)
-    results = data.get("results", [])
-
-    significant_pairs: list[tuple[str, str, float]] = []
+def _parse_deepcsim_pairs(
+    results: list,
+) -> list[tuple[str, str, float]]:
+    """Filter deepcsim results to significant pairs (>=80% similarity, non-dunder)."""
+    significant: list[tuple[str, str, float]] = []
     for pair in results:
         if not isinstance(pair, dict):
             continue
@@ -507,9 +491,8 @@ def stage_duplication(repo: Path, report: ReportData) -> None:
         if not isinstance(sim, (int, float)):
             sim = pair.get("avg_similarity", 0)
 
-        # Check if pair has non-dunder comparisons
         comparisons = pair.get("comparisons", [])
-        has_non_dunder = len(comparisons) == 0  # no comparisons = count it
+        has_non_dunder = len(comparisons) == 0
         for comp in comparisons:
             if not isinstance(comp, dict):
                 continue
@@ -520,11 +503,27 @@ def stage_duplication(repo: Path, report: ReportData) -> None:
                 break
 
         if has_non_dunder and sim >= 80:
-            significant_pairs.append((file1, file2, float(sim)))
+            significant.append((file1, file2, float(sim)))
+
+    return significant
+
+
+def stage_duplication(repo: Path, report: ReportData) -> None:
+    """Run deepcsim for structural duplication detection."""
+    result = _run(["deepcsim-cli", str(repo), "--threshold", "80", "--json"])
+    if result.returncode == 127:
+        report.tool_errors.append("deepcsim-cli: not installed")
+        report.dimensions.append(DimensionResult("Duplication", "skipped", "?", 50))
+        return
+
+    data = _parse_deepcsim_json(result.stdout)
+    significant_pairs = _parse_deepcsim_pairs(data.get("results", []))
 
     clone_groups = len(significant_pairs)
-    for f1, f2, sim in significant_pairs[:10]:
-        summary_lines.append(f"- {f1} <-> {f2} ({sim:.0f}% similar)")
+    summary_lines = [
+        f"- {f1} <-> {f2} ({sim:.0f}% similar)"
+        for f1, f2, sim in significant_pairs[:10]
+    ]
 
     if clone_groups == 0:
         score = 100
@@ -672,6 +671,62 @@ def stage_tsc(repo: Path, report: ReportData) -> None:
 # -- Stage: jscpd (TypeScript duplication) ------------------------------------
 
 
+def _parse_jscpd_report(
+    errors: list[str],
+) -> tuple[float, int, list[str]]:
+    """Parse the jscpd JSON report file.
+
+    Returns (percentage, clone_count, summary_lines).
+    """
+    report_file = Path("/tmp/jscpd-report/jscpd-report.json")
+    data: dict = {}
+    if report_file.exists():
+        try:
+            data = json.loads(report_file.read_text())
+        except json.JSONDecodeError:
+            errors.append("jscpd: JSON parse error")
+
+    statistics = data.get("statistics", {})
+    total_stats = statistics.get("total", {})
+    percentage = total_stats.get("percentage", 0)
+    if not isinstance(percentage, (int, float)):
+        percentage = 0
+
+    clones = data.get("duplicates", [])
+    clone_count = len(clones) if isinstance(clones, list) else 0
+
+    summary_lines: list[str] = []
+    if isinstance(clones, list):
+        for dup in clones[:10]:
+            if not isinstance(dup, dict):
+                continue
+            first = dup.get("firstFile", {})
+            second = dup.get("secondFile", {})
+            f1 = Path(first.get("name", "")).name if isinstance(first, dict) else "?"
+            f2 = Path(second.get("name", "")).name if isinstance(second, dict) else "?"
+            lines_count = dup.get("lines", 0)
+            summary_lines.append(f"- {f1} <-> {f2} ({lines_count} lines)")
+
+    return float(percentage), clone_count, summary_lines
+
+
+def _score_duplication_pct(percentage: float) -> float:
+    """Score duplication percentage on 0-100 scale."""
+    if percentage == 0:
+        return 100
+    if percentage <= 3:
+        return 90
+    if percentage <= 5:
+        return 80
+    if percentage <= 10:
+        return 70
+    if percentage <= 20:
+        return 55
+    if percentage <= 40:
+        return 35
+    return max(10, 35 - int(percentage - 40))
+
+
 def stage_jscpd(repo: Path, report: ReportData) -> None:
     """Run jscpd for copy-paste detection in TypeScript/JavaScript."""
     result = _run(
@@ -693,56 +748,8 @@ def stage_jscpd(repo: Path, report: ReportData) -> None:
         report.dimensions.append(DimensionResult("Duplication", "skipped", "?", 50))
         return
 
-    # jscpd writes JSON report to /tmp/jscpd-report/jscpd-report.json
-    report_file = Path("/tmp/jscpd-report/jscpd-report.json")
-    data: dict = {}
-    if report_file.exists():
-        try:
-            data = json.loads(report_file.read_text())
-        except json.JSONDecodeError:
-            report.tool_errors.append("jscpd: JSON parse error")
-
-    statistics = data.get("statistics", {})
-    # jscpd statistics has a "total" key with percentage
-    total_stats = statistics.get("total", {})
-    percentage = total_stats.get("percentage", 0)
-    if not isinstance(percentage, (int, float)):
-        percentage = 0
-
-    clones = data.get("duplicates", [])
-    clone_count = len(clones) if isinstance(clones, list) else 0
-
-    summary_lines: list[str] = []
-    if isinstance(clones, list):
-        for dup in clones[:10]:
-            if isinstance(dup, dict):
-                first = dup.get("firstFile", {})
-                second = dup.get("secondFile", {})
-                f1 = (
-                    Path(first.get("name", "")).name if isinstance(first, dict) else "?"
-                )
-                f2 = (
-                    Path(second.get("name", "")).name
-                    if isinstance(second, dict)
-                    else "?"
-                )
-                lines_count = dup.get("lines", 0)
-                summary_lines.append(f"- {f1} <-> {f2} ({lines_count} lines)")
-
-    if percentage == 0:
-        score = 100
-    elif percentage <= 3:
-        score = 90
-    elif percentage <= 5:
-        score = 80
-    elif percentage <= 10:
-        score = 70
-    elif percentage <= 20:
-        score = 55
-    elif percentage <= 40:
-        score = 35
-    else:
-        score = max(10, 35 - int(percentage - 40))
+    percentage, clone_count, summary_lines = _parse_jscpd_report(report.tool_errors)
+    score = _score_duplication_pct(percentage)
 
     report.dimensions.append(
         DimensionResult(
