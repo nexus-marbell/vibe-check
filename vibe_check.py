@@ -272,16 +272,12 @@ def _collect_lizard_cc(
         return cc_values, hotspots
     for line in liz.stdout.strip().splitlines()[1:]:
         parts = line.split(",")
-        if len(parts) < 5:
+        if len(parts) < 8:
             continue
         try:
             cc = int(parts[1].strip())
-            func_name = parts[4].strip().strip('"')
-            file_path = (
-                parts[-1].strip().strip('"')
-                if len(parts) > 5
-                else parts[0].strip().strip('"')
-            )
+            func_name = parts[7].strip().strip('"')
+            file_path = parts[6].strip().strip('"')
             cc_values.append(cc)
             if cc > 10:
                 hotspots.append(
