@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -146,11 +147,24 @@ def detect_languages(repo: Path) -> set[str]:
 # -- Stage: Clone / Identify ---------------------------------------------------
 
 
+def _inject_token(url: str) -> str:
+    """Inject GH_TOKEN/GITHUB_TOKEN into HTTPS GitHub URLs for private repo access."""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return url
+    if url.startswith("https://github.com/"):
+        return url.replace(
+            "https://github.com/", f"https://x-access-token:{token}@github.com/"
+        )
+    return url
+
+
 def stage_clone(target: str, workspace: Path) -> tuple[Path, str, str, str]:
     """Clone repo or resolve local path. Returns (path, name, sha, date)."""
     if target.startswith(("http://", "https://", "git@")):
         repo_name = target.rstrip("/").split("/")[-1].removesuffix(".git")
-        result = _run(["git", "clone", "--depth=50", target, str(workspace)])
+        clone_url = _inject_token(target)
+        result = _run(["git", "clone", "--depth=50", clone_url, str(workspace)])
         if result.returncode != 0:
             raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
         repo_path = workspace
