@@ -51,6 +51,7 @@ class ReportData:
     overall_grade: str = "?"
     overall_score: float = 0.0
     risk_flags: list[str] = field(default_factory=list)
+    auto_f_triggers: list[str] = field(default_factory=list)
     hotspots: list[HotspotEntry] = field(default_factory=list)
     duplication_summary: str = ""
     tool_errors: list[str] = field(default_factory=list)
@@ -115,7 +116,8 @@ def detect_languages(repo: Path) -> set[str]:
         py_files = list(repo.rglob("*.py"))
         # Exclude common non-project files
         py_files = [
-            f for f in py_files
+            f
+            for f in py_files
             if ".git" not in f.parts and "node_modules" not in f.parts
         ]
         if py_files:
@@ -135,7 +137,8 @@ def detect_languages(repo: Path) -> set[str]:
     if "typescript" not in languages:
         ts_files = list(repo.rglob("*.ts")) + list(repo.rglob("*.tsx"))
         ts_files = [
-            f for f in ts_files
+            f
+            for f in ts_files
             if ".git" not in f.parts and "node_modules" not in f.parts
         ]
         if ts_files:
@@ -179,16 +182,14 @@ def stage_ruff(repo: Path, report: ReportData) -> None:
     result = _run(["ruff", "check", str(repo), "--output-format", "json"])
     if result.returncode == 127:
         report.tool_errors.append("ruff: not installed")
-        report.dimensions.append(
-            DimensionResult("Linting", "skipped", "?", 50)
-        )
+        report.dimensions.append(DimensionResult("Linting", "skipped", "?", 50))
         return
 
     try:
         issues = json.loads(result.stdout) if result.stdout.strip() else []
     except json.JSONDecodeError:
         issues = []
-        report.tool_errors.append(f"ruff: JSON parse error")
+        report.tool_errors.append("ruff: JSON parse error")
 
     count = len(issues)
     if count == 0:
@@ -219,9 +220,7 @@ def stage_pyright(repo: Path, report: ReportData) -> None:
     result = _run(["pyright", str(repo), "--outputjson"])
     if result.returncode == 127:
         report.tool_errors.append("pyright: not installed")
-        report.dimensions.append(
-            DimensionResult("Type Safety", "skipped", "?", 50)
-        )
+        report.dimensions.append(DimensionResult("Type Safety", "skipped", "?", 50))
         return
 
     try:
@@ -278,13 +277,19 @@ def stage_complexity(repo: Path, report: ReportData) -> None:
                 try:
                     cc = int(parts[1].strip())
                     func_name = parts[4].strip().strip('"')
-                    file_path = parts[-1].strip().strip('"') if len(parts) > 5 else parts[0].strip().strip('"')
+                    file_path = (
+                        parts[-1].strip().strip('"')
+                        if len(parts) > 5
+                        else parts[0].strip().strip('"')
+                    )
                     cc_values.append(cc)
                     if cc > max_cc:
                         max_cc = cc
                     if cc > 10:
                         hotspots.append(
-                            HotspotEntry(file=file_path, function=func_name, cc=cc, mi=0.0)
+                            HotspotEntry(
+                                file=file_path, function=func_name, cc=cc, mi=0.0
+                            )
                         )
                 except (ValueError, IndexError):
                     pass
@@ -409,9 +414,7 @@ def stage_health(repo: Path, report: ReportData) -> None:
     result = _run(["pyscn", "analyze", str(repo)])
     if result.returncode == 127:
         report.tool_errors.append("pyscn: not installed")
-        report.dimensions.append(
-            DimensionResult("Health", "skipped", "?", 50)
-        )
+        report.dimensions.append(DimensionResult("Health", "skipped", "?", 50))
         return
 
     # pyscn writes JSON to ~/.pyscn/reports/ but prints text summary to stdout.
@@ -451,9 +454,7 @@ def stage_duplication(repo: Path, report: ReportData) -> None:
     result = _run(["deepcsim-cli", str(repo), "--threshold", "80", "--json"])
     if result.returncode == 127:
         report.tool_errors.append("deepcsim-cli: not installed")
-        report.dimensions.append(
-            DimensionResult("Duplication", "skipped", "?", 50)
-        )
+        report.dimensions.append(DimensionResult("Duplication", "skipped", "?", 50))
         return
 
     summary_lines: list[str] = []
@@ -512,7 +513,11 @@ def stage_duplication(repo: Path, report: ReportData) -> None:
             score,
         )
     )
-    report.duplication_summary = "\n".join(summary_lines) if summary_lines else "No significant duplication found."
+    report.duplication_summary = (
+        "\n".join(summary_lines)
+        if summary_lines
+        else "No significant duplication found."
+    )
 
     if clone_groups > 5:
         report.risk_flags.append(f"{clone_groups} clone groups detected")
@@ -535,9 +540,7 @@ def stage_eslint(repo: Path, report: ReportData) -> None:
     result = _run(cmd)
     if result.returncode == 127:
         report.tool_errors.append("eslint: not installed")
-        report.dimensions.append(
-            DimensionResult("Linting", "skipped", "?", 50)
-        )
+        report.dimensions.append(DimensionResult("Linting", "skipped", "?", 50))
         return
 
     try:
@@ -582,10 +585,7 @@ def stage_tsc(repo: Path, report: ReportData) -> None:
     else:
         # No tsconfig: check all TS files with permissive settings
         ts_files = list(repo.rglob("*.ts")) + list(repo.rglob("*.tsx"))
-        ts_files = [
-            str(f) for f in ts_files
-            if "node_modules" not in f.parts
-        ]
+        ts_files = [str(f) for f in ts_files if "node_modules" not in f.parts]
         if not ts_files:
             report.dimensions.append(
                 DimensionResult("Type Safety", "no .ts files found", "?", 50)
@@ -596,9 +596,7 @@ def stage_tsc(repo: Path, report: ReportData) -> None:
     result = _run(cmd)
     if result.returncode == 127:
         report.tool_errors.append("tsc: not installed")
-        report.dimensions.append(
-            DimensionResult("Type Safety", "skipped", "?", 50)
-        )
+        report.dimensions.append(DimensionResult("Type Safety", "skipped", "?", 50))
         return
 
     # tsc prints errors to stdout, one per line starting with file path
@@ -644,18 +642,23 @@ def stage_tsc(repo: Path, report: ReportData) -> None:
 
 def stage_jscpd(repo: Path, report: ReportData) -> None:
     """Run jscpd for copy-paste detection in TypeScript/JavaScript."""
-    result = _run([
-        "jscpd", str(repo),
-        "--reporters", "json",
-        "--output", "/tmp/jscpd-report",
-        "--ignore", "node_modules,dist,build,.git",
-        "--format", "typescript,javascript",
-    ])
+    result = _run(
+        [
+            "jscpd",
+            str(repo),
+            "--reporters",
+            "json",
+            "--output",
+            "/tmp/jscpd-report",
+            "--ignore",
+            "node_modules,dist,build,.git",
+            "--format",
+            "typescript,javascript",
+        ]
+    )
     if result.returncode == 127:
         report.tool_errors.append("jscpd: not installed")
-        report.dimensions.append(
-            DimensionResult("Duplication", "skipped", "?", 50)
-        )
+        report.dimensions.append(DimensionResult("Duplication", "skipped", "?", 50))
         return
 
     # jscpd writes JSON report to /tmp/jscpd-report/jscpd-report.json
@@ -683,8 +686,14 @@ def stage_jscpd(repo: Path, report: ReportData) -> None:
             if isinstance(dup, dict):
                 first = dup.get("firstFile", {})
                 second = dup.get("secondFile", {})
-                f1 = Path(first.get("name", "")).name if isinstance(first, dict) else "?"
-                f2 = Path(second.get("name", "")).name if isinstance(second, dict) else "?"
+                f1 = (
+                    Path(first.get("name", "")).name if isinstance(first, dict) else "?"
+                )
+                f2 = (
+                    Path(second.get("name", "")).name
+                    if isinstance(second, dict)
+                    else "?"
+                )
                 lines_count = dup.get("lines", 0)
                 summary_lines.append(f"- {f1} <-> {f2} ({lines_count} lines)")
 
@@ -746,20 +755,151 @@ def stage_wily(repo: Path, report: ReportData) -> None:
         pass
 
 
+# -- Stage: Hygiene ------------------------------------------------------------
+
+
+_LICENSE_NAMES = {
+    "LICENSE",
+    "LICENSE.md",
+    "LICENSE.txt",
+    "LICENCE",
+    "LICENCE.md",
+    "LICENCE.txt",
+    "COPYING",
+    "COPYING.md",
+    "COPYING.txt",
+}
+
+_TEST_DIRS = {"tests", "test", "__tests__", "spec", "specs"}
+
+
+def stage_hygiene(repo: Path, report: ReportData) -> None:
+    """Check project hygiene: license, tests, README, .gitignore."""
+    score = 0
+    details: list[str] = []
+
+    # License (25 pts) — absence is also an auto-F trigger
+    has_license = any((repo / name).exists() for name in _LICENSE_NAMES)
+    if has_license:
+        score += 25
+        details.append("License: found")
+    else:
+        details.append("License: MISSING")
+        report.auto_f_triggers.append("No license file (legal risk)")
+
+    # Tests (25 pts)
+    has_tests = any((repo / d).is_dir() for d in _TEST_DIRS)
+    if not has_tests:
+        # Check for test files anywhere
+        test_files = list(repo.rglob("test_*.py")) + list(repo.rglob("*.test.ts"))
+        test_files = [
+            f
+            for f in test_files
+            if ".git" not in f.parts and "node_modules" not in f.parts
+        ]
+        has_tests = len(test_files) > 0
+    if has_tests:
+        score += 25
+        details.append("Tests: found")
+    else:
+        details.append("Tests: MISSING")
+
+    # README (15 pts)
+    readme_files = ["README.md", "README.txt", "README.rst", "README"]
+    has_readme = False
+    for name in readme_files:
+        readme_path = repo / name
+        if readme_path.exists():
+            content = readme_path.read_text(errors="replace").strip()
+            if len(content) > 100:
+                has_readme = True
+            break
+    if has_readme:
+        score += 15
+        details.append("README: found (>100 chars)")
+    else:
+        details.append("README: missing or trivial")
+
+    # .gitignore (10 pts)
+    if (repo / ".gitignore").exists():
+        score += 10
+        details.append(".gitignore: found")
+    else:
+        details.append(".gitignore: MISSING")
+
+    # No hardcoded secrets (25 pts) — simple heuristic check
+    secret_patterns = [
+        re.compile(
+            r"""(?:api[_-]?key|secret|password|token)\s*[:=]\s*["'][^"']{8,}["']""",
+            re.IGNORECASE,
+        ),
+    ]
+    secrets_found = False
+    for py_or_ts in (
+        list(repo.rglob("*.py"))
+        + list(repo.rglob("*.ts"))
+        + list(repo.rglob("*.js"))
+        + list(repo.rglob("*.env"))
+    ):
+        if ".git" in py_or_ts.parts or "node_modules" in py_or_ts.parts:
+            continue
+        try:
+            content = py_or_ts.read_text(errors="replace")
+            for pat in secret_patterns:
+                if pat.search(content):
+                    secrets_found = True
+                    break
+        except OSError:
+            continue
+        if secrets_found:
+            break
+
+    if not secrets_found:
+        score += 25
+        details.append("Secrets scan: clean")
+    else:
+        details.append("Secrets scan: POTENTIAL SECRETS FOUND")
+        report.auto_f_triggers.append("Potential hardcoded secrets detected")
+
+    raw_text = f"{score}/100 ({', '.join(details)})"
+    report.dimensions.append(
+        DimensionResult("Hygiene", raw_text, _score_to_grade(score), score)
+    )
+
+
 # -- Grading -------------------------------------------------------------------
 
 
 _WEIGHTS = {
-    "Health": 0.30,
-    "Linting": 0.15,
-    "Type Safety": 0.15,
+    "Health": 0.25,
+    "Linting": 0.10,
+    "Type Safety": 0.10,
     "Complexity": 0.25,
     "Duplication": 0.15,
+    "Hygiene": 0.15,
 }
 
 
+def _check_auto_f_triggers(report: ReportData) -> None:
+    """Check for conditions that force an automatic F grade."""
+    # Max CC > 50
+    for h in report.hotspots:
+        if h.cc > 50:
+            report.auto_f_triggers.append(
+                f"Function {h.function} in {Path(h.file).name} has CC={h.cc} (>50)"
+            )
+            break
+
+    # > 60% duplication (already flagged by jscpd stage, check risk_flags)
+    for flag in report.risk_flags:
+        if "exceeds 60% threshold" in flag and flag not in report.auto_f_triggers:
+            report.auto_f_triggers.append(flag)
+
+
 def compute_overall(report: ReportData) -> None:
-    """Compute weighted overall grade."""
+    """Compute weighted overall grade. Auto-F triggers override."""
+    _check_auto_f_triggers(report)
+
     weighted_sum = 0.0
     weight_sum = 0.0
     for dim in report.dimensions:
@@ -773,7 +913,12 @@ def compute_overall(report: ReportData) -> None:
     else:
         report.overall_score = 50
 
-    report.overall_grade = _score_to_grade(report.overall_score)
+    # Auto-F override
+    if report.auto_f_triggers:
+        report.overall_grade = "F"
+        report.overall_score = min(report.overall_score, 39)
+    else:
+        report.overall_grade = _score_to_grade(report.overall_score)
 
 
 def _recommendation(grade: str) -> str:
@@ -784,7 +929,9 @@ def _recommendation(grade: str) -> str:
     if grade == "C":
         return "Notable quality issues. Contribute with caution; plan refactoring."
     if grade == "D":
-        return "Significant structural problems. Fork and refactor before depending on it."
+        return (
+            "Significant structural problems. Fork and refactor before depending on it."
+        )
     return "Critical quality issues. Walk away or plan a complete rewrite."
 
 
@@ -808,6 +955,14 @@ def render_report(report: ReportData) -> str:
     for dim in report.dimensions:
         lines.append(f"| {dim.name} | {dim.raw_value} | {dim.grade} |")
     lines.append("")
+
+    # Auto-F triggers
+    if report.auto_f_triggers:
+        lines.append("## Auto-F Triggers")
+        lines.append("**Grade forced to F due to critical issues:**")
+        for trigger in report.auto_f_triggers:
+            lines.append(f"- {trigger}")
+        lines.append("")
 
     # Risk flags
     if report.risk_flags:
@@ -859,7 +1014,9 @@ def main() -> None:
 
     # Determine workspace
     if target.startswith(("http://", "https://", "git@")):
-        workspace = _WORKSPACE if _WORKSPACE.parent.exists() else Path(tempfile.mkdtemp())
+        workspace = (
+            _WORKSPACE if _WORKSPACE.parent.exists() else Path(tempfile.mkdtemp())
+        )
     else:
         workspace = Path(target).resolve()
 
@@ -877,7 +1034,10 @@ def main() -> None:
     # Stage 2: Detect languages
     languages = detect_languages(repo_path)
     if not languages:
-        print("WARNING: No Python or TypeScript files detected. Running Python toolchain as fallback.", file=sys.stderr)
+        print(
+            "WARNING: No Python or TypeScript files detected. Running Python toolchain as fallback.",
+            file=sys.stderr,
+        )
         languages = {"python"}
 
     # Stage 3: Lint
@@ -908,7 +1068,10 @@ def main() -> None:
     # Stage 8: History (wily) -- informational, no dimension
     stage_wily(repo_path, report)
 
-    # Compute overall grade
+    # Stage 9: Hygiene (license, tests, README, .gitignore, secrets)
+    stage_hygiene(repo_path, report)
+
+    # Compute overall grade (includes auto-F trigger check)
     compute_overall(report)
 
     # Output
