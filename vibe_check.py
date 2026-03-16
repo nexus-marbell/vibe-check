@@ -262,113 +262,147 @@ def stage_pyright(repo: Path, report: ReportData) -> None:
 # -- Stage: Complexity (lizard + radon) ----------------------------------------
 
 
-def stage_complexity(repo: Path, report: ReportData) -> None:
-    """Run lizard and radon for CC and MI metrics."""
-    hotspots: list[HotspotEntry] = []
-    max_cc = 0
+def _collect_lizard_cc(
+    repo: Path, errors: list[str]
+) -> tuple[list[int], list[HotspotEntry]]:
+    """Run lizard and return (cc_values, hotspots)."""
     cc_values: list[int] = []
-
-    # -- lizard (CSV) --
+    hotspots: list[HotspotEntry] = []
     liz = _run(["lizard", str(repo), "--csv"])
-    if liz.returncode != 127 and liz.stdout.strip():
-        for line in liz.stdout.strip().splitlines()[1:]:  # skip header
-            parts = line.split(",")
-            if len(parts) >= 5:
-                try:
-                    cc = int(parts[1].strip())
-                    func_name = parts[4].strip().strip('"')
-                    file_path = (
-                        parts[-1].strip().strip('"')
-                        if len(parts) > 5
-                        else parts[0].strip().strip('"')
-                    )
-                    cc_values.append(cc)
-                    if cc > max_cc:
-                        max_cc = cc
-                    if cc > 10:
-                        hotspots.append(
-                            HotspotEntry(
-                                file=file_path, function=func_name, cc=cc, mi=0.0
-                            )
-                        )
-                except (ValueError, IndexError):
-                    pass
-    elif liz.returncode == 127:
-        report.tool_errors.append("lizard: not installed")
-
-    # -- radon CC (JSON) --
-    radon_cc = _run(["radon", "cc", str(repo), "-j", "-a"])
-    radon_cc_data: dict = {}
-    if radon_cc.returncode != 127 and radon_cc.stdout.strip():
+    if liz.returncode == 127:
+        errors.append("lizard: not installed")
+        return cc_values, hotspots
+    if not liz.stdout.strip():
+        return cc_values, hotspots
+    for line in liz.stdout.strip().splitlines()[1:]:
+        parts = line.split(",")
+        if len(parts) < 5:
+            continue
         try:
-            radon_cc_data = json.loads(radon_cc.stdout)
-        except json.JSONDecodeError:
-            report.tool_errors.append("radon cc: JSON parse error")
+            cc = int(parts[1].strip())
+            func_name = parts[4].strip().strip('"')
+            file_path = (
+                parts[-1].strip().strip('"')
+                if len(parts) > 5
+                else parts[0].strip().strip('"')
+            )
+            cc_values.append(cc)
+            if cc > 10:
+                hotspots.append(
+                    HotspotEntry(file=file_path, function=func_name, cc=cc, mi=0.0)
+                )
+        except (ValueError, IndexError):
+            pass
+    return cc_values, hotspots
 
-    for filepath, blocks in radon_cc_data.items():
+
+def _collect_radon_cc(
+    repo: Path, errors: list[str]
+) -> tuple[list[int], list[HotspotEntry]]:
+    """Run radon CC and return (cc_values, hotspots)."""
+    cc_values: list[int] = []
+    hotspots: list[HotspotEntry] = []
+    result = _run(["radon", "cc", str(repo), "-j", "-a"])
+    if result.returncode == 127:
+        return cc_values, hotspots
+    if not result.stdout.strip():
+        return cc_values, hotspots
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        errors.append("radon cc: JSON parse error")
+        return cc_values, hotspots
+
+    for filepath, blocks in data.items():
         if not isinstance(blocks, list):
             continue
         for block in blocks:
-            if isinstance(block, dict):
-                cc = block.get("complexity", 0)
-                name = block.get("name", "?")
-                cc_values.append(cc)
-                if cc > max_cc:
-                    max_cc = cc
-                if cc > 10:
-                    hotspots.append(
-                        HotspotEntry(file=filepath, function=name, cc=cc, mi=0.0)
-                    )
+            if not isinstance(block, dict):
+                continue
+            cc = block.get("complexity", 0)
+            name = block.get("name", "?")
+            cc_values.append(cc)
+            if cc > 10:
+                hotspots.append(
+                    HotspotEntry(file=filepath, function=name, cc=cc, mi=0.0)
+                )
+    return cc_values, hotspots
 
-    # -- radon MI (JSON) --
-    radon_mi = _run(["radon", "mi", str(repo), "-j"])
+
+def _collect_radon_mi(
+    repo: Path, hotspots: list[HotspotEntry], errors: list[str]
+) -> list[float]:
+    """Run radon MI and return mi_values. Attaches MI to matching hotspots."""
     mi_values: list[float] = []
-    if radon_mi.returncode != 127 and radon_mi.stdout.strip():
-        try:
-            mi_data = json.loads(radon_mi.stdout)
-            for filepath, mi_info in mi_data.items():
-                if isinstance(mi_info, dict):
-                    mi_val = mi_info.get("mi", 0)
-                    mi_values.append(float(mi_val))
-                    # Attach MI to hotspots from same file
-                    for h in hotspots:
-                        if h.file == filepath:
-                            h.mi = float(mi_val)
-                elif isinstance(mi_info, (int, float)):
-                    mi_values.append(float(mi_info))
-        except json.JSONDecodeError:
-            report.tool_errors.append("radon mi: JSON parse error")
-    elif radon_mi.returncode == 127:
-        report.tool_errors.append("radon: not installed")
+    result = _run(["radon", "mi", str(repo), "-j"])
+    if result.returncode == 127:
+        errors.append("radon: not installed")
+        return mi_values
+    if not result.stdout.strip():
+        return mi_values
+    try:
+        mi_data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        errors.append("radon mi: JSON parse error")
+        return mi_values
+
+    for filepath, mi_info in mi_data.items():
+        if isinstance(mi_info, dict):
+            mi_val = float(mi_info.get("mi", 0))
+            mi_values.append(mi_val)
+            for h in hotspots:
+                if h.file == filepath:
+                    h.mi = mi_val
+        elif isinstance(mi_info, (int, float)):
+            mi_values.append(float(mi_info))
+    return mi_values
+
+
+def _score_cc(avg_cc: float, max_cc: int) -> float:
+    """Score cyclomatic complexity on 0-100 scale."""
+    if avg_cc <= 3 and max_cc <= 10:
+        return 95
+    if avg_cc <= 5 and max_cc <= 15:
+        return 80
+    if avg_cc <= 8 and max_cc <= 20:
+        return 65
+    if avg_cc <= 12:
+        return 45
+    return 25
+
+
+def _score_mi(avg_mi: float, has_data: bool) -> float:
+    """Score maintainability index on 0-100 scale."""
+    if not has_data:
+        return 50  # no data = neutral
+    if avg_mi >= 40:
+        return 95
+    if avg_mi >= 30:
+        return 80
+    if avg_mi >= 20:
+        return 60
+    if avg_mi >= 10:
+        return 40
+    return 20
+
+
+def stage_complexity(repo: Path, report: ReportData) -> None:
+    """Run lizard and radon for CC and MI metrics."""
+    liz_cc, liz_hotspots = _collect_lizard_cc(repo, report.tool_errors)
+    radon_cc, radon_hotspots = _collect_radon_cc(repo, report.tool_errors)
+
+    cc_values = liz_cc + radon_cc
+    hotspots = liz_hotspots + radon_hotspots
+    max_cc = max(cc_values) if cc_values else 0
+
+    mi_values = _collect_radon_mi(repo, hotspots, report.tool_errors)
 
     avg_cc = sum(cc_values) / len(cc_values) if cc_values else 0
     avg_mi = sum(mi_values) / len(mi_values) if mi_values else 0
 
-    # Score complexity: based on avg CC and max CC
-    if avg_cc <= 3 and max_cc <= 10:
-        cc_score = 95
-    elif avg_cc <= 5 and max_cc <= 15:
-        cc_score = 80
-    elif avg_cc <= 8 and max_cc <= 20:
-        cc_score = 65
-    elif avg_cc <= 12:
-        cc_score = 45
-    else:
-        cc_score = 25
+    cc_score = _score_cc(avg_cc, max_cc)
+    mi_score = _score_mi(avg_mi, bool(mi_values))
 
-    # Score maintainability: based on avg MI
-    if avg_mi >= 40:
-        mi_score = 95
-    elif avg_mi >= 30:
-        mi_score = 80
-    elif avg_mi >= 20:
-        mi_score = 60
-    elif avg_mi >= 10:
-        mi_score = 40
-    else:
-        mi_score = 20 if mi_values else 50  # no data = neutral
-
-    # Combined complexity dimension: 60% CC + 40% MI
     combined = cc_score * 0.6 + mi_score * 0.4
     raw_text = f"avg CC {avg_cc:.1f}, max CC {max_cc}"
     if mi_values:
@@ -378,13 +412,11 @@ def stage_complexity(repo: Path, report: ReportData) -> None:
         DimensionResult("Complexity", raw_text, _score_to_grade(combined), combined)
     )
 
-    # MI dimension separately
     mi_raw = f"avg MI {avg_mi:.1f}" if mi_values else "no data"
     report.dimensions.append(
         DimensionResult("Maintainability", mi_raw, _score_to_grade(mi_score), mi_score)
     )
 
-    # Sort hotspots by CC descending, keep top 10
     hotspots.sort(key=lambda h: h.cc, reverse=True)
     report.hotspots = hotspots[:10]
 
@@ -773,12 +805,58 @@ _LICENSE_NAMES = {
 _TEST_DIRS = {"tests", "test", "__tests__", "spec", "specs"}
 
 
+def _check_has_tests(repo: Path) -> bool:
+    """Check if the repo has a test directory or test files."""
+    if any((repo / d).is_dir() for d in _TEST_DIRS):
+        return True
+    test_files = (
+        list(repo.rglob("test_*.py"))
+        + list(repo.rglob("*.test.ts"))
+        + list(repo.rglob("*.spec.ts"))
+    )
+    test_files = [
+        f for f in test_files if ".git" not in f.parts and "node_modules" not in f.parts
+    ]
+    return len(test_files) > 0
+
+
+def _check_has_readme(repo: Path) -> bool:
+    """Check if the repo has a non-trivial README (>100 chars)."""
+    for name in ("README.md", "README.txt", "README.rst", "README"):
+        readme_path = repo / name
+        if readme_path.exists():
+            content = readme_path.read_text(errors="replace").strip()
+            return len(content) > 100
+    return False
+
+
+_SECRET_PATTERN = re.compile(
+    r"""(?:api[_-]?key|secret|password|token)\s*[:=]\s*["'][^"']{8,}["']""",
+    re.IGNORECASE,
+)
+
+
+def _scan_for_secrets(repo: Path) -> bool:
+    """Scan source files for potential hardcoded secrets."""
+    globs = ("*.py", "*.ts", "*.js", "*.env")
+    for pattern in globs:
+        for filepath in repo.rglob(pattern):
+            if ".git" in filepath.parts or "node_modules" in filepath.parts:
+                continue
+            try:
+                content = filepath.read_text(errors="replace")
+                if _SECRET_PATTERN.search(content):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def stage_hygiene(repo: Path, report: ReportData) -> None:
-    """Check project hygiene: license, tests, README, .gitignore."""
+    """Check project hygiene: license, tests, README, .gitignore, secrets."""
     score = 0
     details: list[str] = []
 
-    # License (25 pts) — absence is also an auto-F trigger
     has_license = any((repo / name).exists() for name in _LICENSE_NAMES)
     if has_license:
         score += 25
@@ -787,74 +865,25 @@ def stage_hygiene(repo: Path, report: ReportData) -> None:
         details.append("License: MISSING")
         report.auto_f_triggers.append("No license file (legal risk)")
 
-    # Tests (25 pts)
-    has_tests = any((repo / d).is_dir() for d in _TEST_DIRS)
-    if not has_tests:
-        # Check for test files anywhere
-        test_files = list(repo.rglob("test_*.py")) + list(repo.rglob("*.test.ts"))
-        test_files = [
-            f
-            for f in test_files
-            if ".git" not in f.parts and "node_modules" not in f.parts
-        ]
-        has_tests = len(test_files) > 0
-    if has_tests:
+    if _check_has_tests(repo):
         score += 25
         details.append("Tests: found")
     else:
         details.append("Tests: MISSING")
 
-    # README (15 pts)
-    readme_files = ["README.md", "README.txt", "README.rst", "README"]
-    has_readme = False
-    for name in readme_files:
-        readme_path = repo / name
-        if readme_path.exists():
-            content = readme_path.read_text(errors="replace").strip()
-            if len(content) > 100:
-                has_readme = True
-            break
-    if has_readme:
+    if _check_has_readme(repo):
         score += 15
         details.append("README: found (>100 chars)")
     else:
         details.append("README: missing or trivial")
 
-    # .gitignore (10 pts)
     if (repo / ".gitignore").exists():
         score += 10
         details.append(".gitignore: found")
     else:
         details.append(".gitignore: MISSING")
 
-    # No hardcoded secrets (25 pts) — simple heuristic check
-    secret_patterns = [
-        re.compile(
-            r"""(?:api[_-]?key|secret|password|token)\s*[:=]\s*["'][^"']{8,}["']""",
-            re.IGNORECASE,
-        ),
-    ]
-    secrets_found = False
-    for py_or_ts in (
-        list(repo.rglob("*.py"))
-        + list(repo.rglob("*.ts"))
-        + list(repo.rglob("*.js"))
-        + list(repo.rglob("*.env"))
-    ):
-        if ".git" in py_or_ts.parts or "node_modules" in py_or_ts.parts:
-            continue
-        try:
-            content = py_or_ts.read_text(errors="replace")
-            for pat in secret_patterns:
-                if pat.search(content):
-                    secrets_found = True
-                    break
-        except OSError:
-            continue
-        if secrets_found:
-            break
-
-    if not secrets_found:
+    if not _scan_for_secrets(repo):
         score += 25
         details.append("Secrets scan: clean")
     else:
