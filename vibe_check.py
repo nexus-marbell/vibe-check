@@ -592,7 +592,7 @@ def stage_tsc(repo: Path, report: ReportData) -> None:
                 DimensionResult("Type Safety", "no .ts files found", "?", 50)
             )
             return
-        cmd = ["tsc", "--noEmit", "--allowJs", "--checkJs", "false"] + ts_files
+        cmd = ["tsc", "--noEmit", "--allowJs"] + ts_files
 
     result = _run(cmd)
     if result.returncode == 127:
