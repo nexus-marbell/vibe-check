@@ -91,6 +91,12 @@ Missing tools are skipped gracefully. Docker is the intended workflow — all to
 
 Language is auto-detected from project markers (`pyproject.toml`, `tsconfig.json`, file extensions). Mixed-language repos run both toolchains.
 
+### Beyond Python and TypeScript
+
+Lizard supports complexity analysis for many languages: **Rust, C, C++, Java, Go, Ruby, Swift, Objective-C, Scala, Lua**, and others. For repos in these languages, vibe-check still produces useful results -- complexity hotspots, hygiene checks, and duplication detection all work. Linting and type safety stages are skipped (no ruff/pyright/eslint/tsc), so those dimensions score neutral.
+
+This means vibe-check can grade any repo, not just Python/TypeScript. The complexity and hygiene dimensions alone catch god-functions, missing licenses, and hardcoded secrets regardless of language.
+
 ## Grading
 
 Each dimension gets a letter grade (A-F). Overall grade is a weighted average:
