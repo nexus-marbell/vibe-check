@@ -232,7 +232,7 @@ def stage_ruff(repo: Path, report: ReportData) -> None:
 
 def stage_pyright(repo: Path, report: ReportData) -> None:
     """Run pyright type checker, count errors."""
-    result = _run(["pyright", str(repo), "--outputjson"])
+    result = _run(["pyright", ".", "--outputjson"], cwd=repo)
     if result.returncode == 127:
         report.tool_errors.append("pyright: not installed")
         report.dimensions.append(DimensionResult("Type Safety", "skipped", "?", 50))
