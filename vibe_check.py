@@ -530,101 +530,85 @@ def stage_health(repo: Path, report: ReportData) -> None:
         report.risk_flags.append(f"pyscn health score {score:.0f} (Grade F)")
 
 
-# -- Stage: Duplication (deepcsim) ---------------------------------------------
+# -- Stage: Duplication (pyscn JSON) -------------------------------------------
 
 
-def _parse_deepcsim_json(raw: str) -> dict:
-    """Parse deepcsim JSON, skipping preamble text like 'Starting directory scan...'."""
-    idx = raw.find("{")
-    if idx < 0:
-        return {}
-    try:
-        return json.loads(raw[idx:])
-    except json.JSONDecodeError:
-        return {}
+def _summarize_pyscn_clones(clones: list, limit: int = 10) -> list[str]:
+    """Render up to `limit` lines describing clone fragments by file path.
 
-
-def _is_dunder_pair(func1: str, func2: str) -> bool:
-    """Return True if both functions are dunder methods (noise in deepcsim)."""
-    dunders = {"__init__", "__repr__", "__str__", "__eq__", "__hash__"}
-    return func1 in dunders and func2 in dunders
-
-
-def _parse_deepcsim_pairs(
-    results: list,
-) -> list[tuple[str, str, float]]:
-    """Filter deepcsim results to significant pairs (>=80% similarity, non-dunder)."""
-    significant: list[tuple[str, str, float]] = []
-    for pair in results:
-        if not isinstance(pair, dict):
+    pyscn's clone JSON lists fragments (each participating in a clone group)
+    rather than file pairs. Group fragments by file_path and emit one line
+    per top file with a fragment count, for human-readable summaries.
+    """
+    counts: dict[str, int] = {}
+    for clone in clones:
+        if not isinstance(clone, dict):
             continue
-        file1 = Path(pair.get("file1", "")).name
-        file2 = Path(pair.get("file2", "")).name
-        sim = pair.get("similarity", 0)
-        if not isinstance(sim, (int, float)):
-            sim = pair.get("avg_similarity", 0)
-
-        comparisons = pair.get("comparisons", [])
-        has_non_dunder = len(comparisons) == 0
-        for comp in comparisons:
-            if not isinstance(comp, dict):
-                continue
-            f1 = comp.get("func1_name", "")
-            f2 = comp.get("func2_name", "")
-            if not _is_dunder_pair(f1, f2):
-                has_non_dunder = True
-                break
-
-        if has_non_dunder and sim >= 80:
-            significant.append((file1, file2, float(sim)))
-
-    return significant
+        location = clone.get("location") or {}
+        path = location.get("file_path", "")
+        if path:
+            counts[Path(path).name] = counts.get(Path(path).name, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])[:limit]
+    return [f"- {name}: {n} clone fragment{'s' if n != 1 else ''}" for name, n in ranked]
 
 
 def stage_duplication(repo: Path, report: ReportData) -> None:
-    """Run deepcsim for structural duplication detection."""
-    result = _run(["deepcsim-cli", str(repo), "--threshold", "80", "--json"])
-    if result.returncode == 127:
-        report.tool_errors.append("deepcsim-cli: not installed")
-        report.dimensions.append(DimensionResult("Duplication", "skipped", "?", 50))
+    """Read duplication metrics from the pyscn JSON report.
+
+    pyscn runs in stage_health (which precedes this stage for Python repos)
+    and writes a JSON report to <repo>/.pyscn/reports/. We read the
+    `summary.duplication_score`, `summary.clone_groups`, and
+    `summary.code_duplication_percentage` fields directly from that report.
+
+    Issue #16: previously ran deepcsim-cli with AST-shape similarity matching,
+    which produced false-positive 100% matches between unrelated files at the
+    default threshold (e.g., a test module flagged 100% similar to an unrelated
+    production module purely on function-count/depth shape). The duplication
+    dimension was therefore unusable as a quality signal. Replaced with pyscn's
+    clone detection (APTED algorithm + content-aware), which has more
+    conservative match semantics and reports actual code-duplication-percentage.
+    """
+    json_path = _find_pyscn_json("", repo)
+    if json_path is None:
+        # pyscn didn't write a JSON report (e.g., not installed; stage_health
+        # would have flagged that already). Surface the missing signal cleanly
+        # rather than masquerading as either success or a real F.
+        report.tool_errors.append("pyscn: no JSON report (duplication stage)")
+        report.dimensions.append(DimensionResult("Duplication", "unparsed", "?", 50))
         return
 
-    data = _parse_deepcsim_json(result.stdout)
-    significant_pairs = _parse_deepcsim_pairs(data.get("results", []))
+    try:
+        with json_path.open() as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        report.tool_errors.append("pyscn: malformed JSON (duplication stage)")
+        report.dimensions.append(DimensionResult("Duplication", "unparsed", "?", 50))
+        return
 
-    clone_groups = len(significant_pairs)
-    summary_lines = [
-        f"- {f1} <-> {f2} ({sim:.0f}% similar)"
-        for f1, f2, sim in significant_pairs[:10]
-    ]
+    summary = data.get("summary", {}) or {}
+    score_raw = summary.get("duplication_score")
+    clone_groups = summary.get("clone_groups", 0) or 0
+    duplication_pct = summary.get("code_duplication_percentage", 0) or 0
 
-    if clone_groups == 0:
-        score = 100
-    elif clone_groups <= 2:
-        score = 85
-    elif clone_groups <= 5:
-        score = 70
-    elif clone_groups <= 10:
-        score = 50
-    else:
-        score = max(15, 50 - (clone_groups - 10) * 3)
+    if not isinstance(score_raw, (int, float)):
+        report.tool_errors.append("pyscn: duplication_score missing from summary")
+        report.dimensions.append(DimensionResult("Duplication", "unparsed", "?", 50))
+        return
 
+    score = float(score_raw)
+    raw_value = f"{int(clone_groups)} clone group{'s' if clone_groups != 1 else ''} ({float(duplication_pct):.1f}% duplication)"
     report.dimensions.append(
-        DimensionResult(
-            "Duplication",
-            f"{clone_groups} clone groups",
-            _score_to_grade(score),
-            score,
-        )
+        DimensionResult("Duplication", raw_value, _score_to_grade(score), score)
     )
+
+    clones = (data.get("clone") or {}).get("clones") or []
+    summary_lines = _summarize_pyscn_clones(clones)
     report.duplication_summary = (
-        "\n".join(summary_lines)
-        if summary_lines
-        else "No significant duplication found."
+        "\n".join(summary_lines) if summary_lines else "No significant duplication found."
     )
 
     if clone_groups > 5:
-        report.risk_flags.append(f"{clone_groups} clone groups detected")
+        report.risk_flags.append(f"{int(clone_groups)} clone groups detected")
 
 
 # -- Stage: ESLint (TypeScript linting) ----------------------------------------
