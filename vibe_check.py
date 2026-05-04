@@ -444,26 +444,84 @@ def stage_complexity(repo: Path, report: ReportData) -> None:
 # -- Stage: Health (pyscn) ----------------------------------------------------
 
 
-def _parse_pyscn_text(text: str) -> float:
-    """Extract health score from pyscn text output (e.g. 'Health Score: 84/100')."""
+def _parse_pyscn_text(text: str) -> float | None:
+    """Extract health score from pyscn text output (e.g. 'Health Score: 84/100').
+
+    Returns None if no match — distinguishes parser failure from a real 0/100.
+    """
     match = re.search(r"Health\s+Score:\s*(\d+)/100", text)
     if match:
         return float(match.group(1))
-    return 0.0
+    return None
+
+
+def _find_pyscn_json(stdout: str, repo: Path) -> Path | None:
+    """Locate the pyscn JSON report file from --json output.
+
+    Primary: parse the "Unified JSON report generated: <path>" line pyscn prints.
+    Fallback: glob for the newest analyze_*.json in <repo>/.pyscn/reports/.
+    """
+    match = re.search(r"JSON report generated:\s*(\S+\.json)", stdout)
+    if match:
+        path = Path(match.group(1))
+        if path.exists():
+            return path
+
+    reports_dir = repo / ".pyscn" / "reports"
+    if reports_dir.exists():
+        candidates = sorted(
+            reports_dir.glob("analyze_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def _parse_pyscn_json(json_path: Path) -> float | None:
+    """Read summary.health_score from a pyscn JSON report. Returns None on failure."""
+    try:
+        with json_path.open() as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    score = data.get("summary", {}).get("health_score")
+    if isinstance(score, (int, float)):
+        return float(score)
+    return None
 
 
 def stage_health(repo: Path, report: ReportData) -> None:
-    """Run pyscn health scanner."""
-    result = _run(["pyscn", "analyze", str(repo)])
+    """Run pyscn health scanner.
+
+    Parses the structured JSON report (primary) and falls back to text-regex on
+    stdout (legacy). A parser failure is distinguished from a real 0/100 score:
+    the dimension is marked "unparsed" with grade "?" and neutral score 50, and
+    no Grade-F risk flag is added — see issue #17.
+    """
+    result = _run(["pyscn", "analyze", "--json", str(repo)])
     if result.returncode == 127:
         report.tool_errors.append("pyscn: not installed")
         report.dimensions.append(DimensionResult("Health", "skipped", "?", 50))
         return
 
-    # pyscn writes JSON to ~/.pyscn/reports/ but prints text summary to stdout.
-    # Parse the text output for "Health Score: N/100".
-    combined = result.stdout + result.stderr
-    score = _parse_pyscn_text(combined)
+    # Primary: read structured score from JSON report.
+    score: float | None = None
+    json_path = _find_pyscn_json(result.stdout, repo)
+    if json_path is not None:
+        score = _parse_pyscn_json(json_path)
+
+    # Fallback: text-regex on combined stdout+stderr (legacy path).
+    if score is None:
+        score = _parse_pyscn_text(result.stdout + result.stderr)
+
+    if score is None:
+        # Tool ran but no score could be extracted. Surface the parser failure
+        # rather than masquerading it as a real Grade-F finding.
+        report.tool_errors.append("pyscn: could not parse health score")
+        report.dimensions.append(DimensionResult("Health", "unparsed", "?", 50))
+        return
 
     report.dimensions.append(
         DimensionResult("Health", f"{score:.0f}/100", _score_to_grade(score), score)
