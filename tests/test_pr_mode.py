@@ -14,6 +14,8 @@ from vibe_check import (
     _build_parser,
     _diff_reports,
     _direction_arrow,
+    _git_auth_env,
+    _new_clone_workspace,
     _parse_gitlab_mr_url,
     _parse_pr_url,
     _resolve_pr_refs,
@@ -366,6 +368,30 @@ class TestArgparse:
         )
         assert args.compare == "main...feat"
         assert args.target == "/local/path"
+
+
+class TestCloneHelpers:
+    def test_new_clone_workspace_falls_back_to_temp_when_workspace_missing(self):
+        with patch("vibe_check._WORKSPACE", Path("/definitely/missing/workspace")):
+            workspace = _new_clone_workspace()
+        assert workspace.exists()
+        assert workspace.name.startswith("vibe-check-")
+
+    def test_new_clone_workspace_falls_back_when_workspace_not_empty(self, tmp_path):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        (workspace_root / "existing-file").write_text("busy")
+
+        with patch("vibe_check._WORKSPACE", workspace_root):
+            workspace = _new_clone_workspace()
+
+        assert workspace != workspace_root
+        assert workspace.exists()
+        assert workspace.name.startswith("vibe-check-")
+
+    def test_git_auth_env_disables_prompts_for_https(self):
+        env = _git_auth_env("https://gitlab.example.com/group/project.git")
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
 
 
 # -- _run_analysis (integration-level, mocked tools) -------------------------

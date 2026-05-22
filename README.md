@@ -15,7 +15,7 @@ AI code generation tools produce code that looks clean on the surface but carrie
 
 ## Usage
 
-### Docker (recommended — all 10 tools pre-installed)
+### Docker (recommended for analysis tools)
 
 ```bash
 docker build -t vibe-check .
@@ -25,15 +25,26 @@ docker run --rm vibe-check https://github.com/org/repo
 
 # Grade a local repo (mount it)
 docker run --rm -v /path/to/repo:/workspace vibe-check /workspace
+
+# Recommended for Java repos so compiled artifacts are not written as root
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v /path/to/repo:/workspace -v vibe-check-cache:/tmp/.m2 \
+  vibe-check /workspace
 ```
 
-### Reviewing a PR
+The Docker image includes the analysis toolchain, including OpenJDK 25 plus
+Maven/Gradle for Java compile checks. Provider CLIs and their credentials (`gh`
+for GitHub, `glab` for GitLab) are normally host-local, so use the local CLI for
+automatic PR/MR URL resolution unless you build an image that also contains
+those CLIs and credentials.
+
+### Reviewing a PR or MR
 
 ```bash
-# Automatic — pass a GitHub PR URL (requires gh CLI)
-docker run --rm vibe-check --pr https://github.com/org/repo/pull/123
+# Automatic — pass a GitHub PR URL (requires host gh CLI/auth)
+python vibe_check.py --pr https://github.com/org/repo/pull/123
 
-# Automatic — pass a GitLab MR URL (requires glab CLI in local mode)
+# Automatic — pass a GitLab MR URL (requires host glab CLI/auth)
 python vibe_check.py --pr https://gitlab.example.com/group/repo/-/merge_requests/123
 
 # Manual — specify base and head refs
@@ -62,11 +73,31 @@ Overall: B (80) → C (65) ▼ (-15)
 
 ### Private repos
 
-Pass a GitHub token for private repo access:
+Pass a GitHub token for private GitHub clone access:
 
 ```bash
-docker run --rm -e GH_TOKEN=ghp_xxx vibe-check https://github.com/org/private-repo
-docker run --rm -e GH_TOKEN=ghp_xxx vibe-check --pr https://github.com/org/private-repo/pull/42
+export GH_TOKEN=...
+docker run --rm -e GH_TOKEN vibe-check https://github.com/org/private-repo
+```
+
+For private GitLab MRs, the local CLI can reuse `glab` credentials without
+putting a token in the Git remote URL:
+
+```bash
+glab auth status --hostname gitlab.example.com
+python vibe_check.py --pr https://gitlab.example.com/group/repo/-/merge_requests/42
+```
+
+In Docker, clone/fetch the private repo on the host and mount it for manual
+comparison:
+
+```bash
+git clone https://gitlab.example.com/group/repo.git repo
+cd repo
+git fetch origin main feature-branch
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD":/workspace -v vibe-check-cache:/tmp/.m2 \
+  vibe-check --compare origin/main...origin/feature-branch /workspace
 ```
 
 ### Local (partial — only runs tools you have installed)
