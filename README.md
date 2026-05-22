@@ -85,7 +85,7 @@ Missing tools are skipped gracefully. Docker is the intended workflow — all to
 | Types | pyright | tsc --noEmit | Type safety errors |
 | Complexity | lizard + radon | lizard | Cyclomatic complexity, maintainability index |
 | Health | pyscn | — | Codebase health (dead code, cohesion, coupling) |
-| Duplication | deepcsim | jscpd | Structural code duplication |
+| Duplication | pyscn (APTED) | jscpd | Structural code duplication |
 | Hygiene | built-in | built-in | License, tests, README, .gitignore, secrets |
 | History | wily | — | Complexity trends over git history |
 

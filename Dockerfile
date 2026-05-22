@@ -20,7 +20,6 @@ RUN apt-get update && \
 # Python analysis tools
 RUN pip install --no-cache-dir \
     pyscn \
-    deepcsim \
     wily \
     lizard \
     radon \

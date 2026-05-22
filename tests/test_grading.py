@@ -1,5 +1,6 @@
 """Tests for vibe-check grading logic."""
 
+import json
 from pathlib import Path
 import sys
 
@@ -18,6 +19,8 @@ from vibe_check import (
     _parse_pyscn_text,
     _parse_pyscn_json,
     _find_pyscn_json,
+    _summarize_pyscn_clones,
+    stage_duplication,
 )
 
 
@@ -202,3 +205,99 @@ class TestPyscnHealthParser:
 
     def test_find_json_returns_none_when_no_reports(self, tmp_path):
         assert _find_pyscn_json("", tmp_path) is None
+
+
+class TestPyscnDuplicationStage:
+    """Issue #16 — duplication signal sourced from pyscn JSON, not deepcsim."""
+
+    def _write_pyscn_json(self, repo: Path, payload: dict) -> Path:
+        reports_dir = repo / ".pyscn" / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        path = reports_dir / "analyze_test.json"
+        path.write_text(json.dumps(payload))
+        return path
+
+    def test_summarize_clones_groups_by_file(self):
+        clones = [
+            {"location": {"file_path": "src/a.py"}},
+            {"location": {"file_path": "src/a.py"}},
+            {"location": {"file_path": "src/b.py"}},
+        ]
+        lines = _summarize_pyscn_clones(clones)
+        # Most-frequent file ranked first, line format "<name>: N clone fragment(s)".
+        assert lines[0].startswith("- a.py:")
+        assert "2 clone fragments" in lines[0]
+        assert "1 clone fragment" in lines[1]
+        assert "fragments" not in lines[1]  # singular for n=1
+
+    def test_summarize_clones_handles_missing_locations(self):
+        clones = [{"size": 10}, {"location": None}, {"location": {"file_path": ""}}]
+        assert _summarize_pyscn_clones(clones) == []
+
+    def test_stage_duplication_reads_pyscn_json(self, tmp_path):
+        self._write_pyscn_json(tmp_path, {
+            "summary": {
+                "duplication_score": 100,
+                "clone_groups": 0,
+                "code_duplication_percentage": 0,
+            },
+            "clone": {"clones": []},
+        })
+        report = ReportData()
+        stage_duplication(tmp_path, report)
+        dim = next(d for d in report.dimensions if d.name == "Duplication")
+        assert dim.score == 100.0
+        assert dim.grade == "A"
+        assert "0 clone groups" in dim.raw_value
+        assert "(0.0% duplication)" in dim.raw_value
+        assert report.tool_errors == []
+        assert report.risk_flags == []
+
+    def test_stage_duplication_flags_high_clone_count(self, tmp_path):
+        self._write_pyscn_json(tmp_path, {
+            "summary": {
+                "duplication_score": 30,
+                "clone_groups": 12,
+                "code_duplication_percentage": 18.5,
+            },
+            "clone": {"clones": [{"location": {"file_path": "x.py"}}]},
+        })
+        report = ReportData()
+        stage_duplication(tmp_path, report)
+        dim = next(d for d in report.dimensions if d.name == "Duplication")
+        assert dim.score == 30.0
+        assert dim.grade == "F"
+        assert "12 clone groups" in dim.raw_value
+        # Risk flag fires when clone_groups > 5.
+        assert any("12 clone groups" in flag for flag in report.risk_flags)
+
+    def test_stage_duplication_no_json_distinguishes_from_real_zero(self, tmp_path):
+        # No pyscn report present — unparsed, neutral 50, no Grade-F risk flag.
+        report = ReportData()
+        stage_duplication(tmp_path, report)
+        dim = next(d for d in report.dimensions if d.name == "Duplication")
+        assert dim.score == 50
+        assert dim.grade == "?"
+        assert dim.raw_value == "unparsed"
+        assert any("no JSON report" in err for err in report.tool_errors)
+        assert report.risk_flags == []
+
+    def test_stage_duplication_malformed_json(self, tmp_path):
+        reports_dir = tmp_path / ".pyscn" / "reports"
+        reports_dir.mkdir(parents=True)
+        (reports_dir / "analyze_test.json").write_text("not json")
+        report = ReportData()
+        stage_duplication(tmp_path, report)
+        dim = next(d for d in report.dimensions if d.name == "Duplication")
+        assert dim.score == 50
+        assert dim.grade == "?"
+        assert any("malformed JSON" in err for err in report.tool_errors)
+
+    def test_stage_duplication_missing_score_field(self, tmp_path):
+        self._write_pyscn_json(tmp_path, {"summary": {"clone_groups": 0}})
+        report = ReportData()
+        stage_duplication(tmp_path, report)
+        dim = next(d for d in report.dimensions if d.name == "Duplication")
+        assert dim.score == 50
+        assert dim.grade == "?"
+        assert any("duplication_score missing" in err for err in report.tool_errors)
