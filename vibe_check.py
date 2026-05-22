@@ -1118,8 +1118,6 @@ def _java_build_command(repo: Path) -> list[str] | None:
         return ["mvn", "-q", "-DskipTests", "compile"]
     if (repo / "gradlew").exists():
         return [str(repo / "gradlew"), "classes", "--quiet"]
-    if (repo / "build.gradle").exists() or (repo / "build.gradle.kts").exists():
-        return ["gradle", "classes", "--quiet"]
     return None
 
 
@@ -1131,7 +1129,7 @@ def stage_java_semantics(repo: Path, report: ReportData) -> None:
             report,
             "Type Safety",
             "skipped",
-            "java: no Maven or Gradle build file found",
+            "java: no Maven build file or Gradle wrapper found",
         )
         return
 
