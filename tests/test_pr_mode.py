@@ -14,8 +14,11 @@ from vibe_check import (
     _build_parser,
     _diff_reports,
     _direction_arrow,
+    _parse_gitlab_mr_url,
     _parse_pr_url,
     _resolve_pr_refs,
+    _resolve_gitlab_mr_refs,
+    resolve_review_target,
     _run_analysis,
 )
 
@@ -77,6 +80,28 @@ class TestParsePrUrl:
             _parse_pr_url("/some/local/path")
 
 
+class TestParseGitLabMrUrl:
+    def test_standard_gitlab_url(self):
+        host, project, iid = _parse_gitlab_mr_url(
+            "https://gitlab.example.com/group/project/-/merge_requests/42"
+        )
+        assert host == "gitlab.example.com"
+        assert project == "group/project"
+        assert iid == 42
+
+    def test_nested_project_url(self):
+        host, project, iid = _parse_gitlab_mr_url(
+            "https://gitlab.example.com/group/platform/shop/-/merge_requests/49"
+        )
+        assert host == "gitlab.example.com"
+        assert project == "group/platform/shop"
+        assert iid == 49
+
+    def test_invalid_gitlab_url_raises(self):
+        with pytest.raises(ValueError, match="Invalid GitLab MR URL"):
+            _parse_gitlab_mr_url("https://gitlab.example.com/group/project/issues/1")
+
+
 # -- _resolve_pr_refs (mocked gh CLI) ----------------------------------------
 
 
@@ -125,6 +150,52 @@ class TestResolvePrRefs:
                 _resolve_pr_refs(
                     "https://github.com/acme/widgets/pull/10"
                 )
+
+
+class TestResolveGitLabMrRefs:
+    def test_success(self):
+        mock_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"target_branch":"main","source_branch":"feature/x"}',
+            stderr="",
+        )
+        with patch("vibe_check._run", return_value=mock_result) as run:
+            target = _resolve_gitlab_mr_refs(
+                "https://gitlab.example.com/group/project/-/merge_requests/12"
+            )
+        assert target.provider == "gitlab"
+        assert target.repo_url == "https://gitlab.example.com/group/project.git"
+        assert target.base_ref == "main"
+        assert target.head_ref == "feature/x"
+        assert target.repo_slug == "gitlab.example.com/group/project"
+        assert "projects/group%2Fproject/merge_requests/12" in run.call_args.args[0]
+
+    def test_glab_not_found(self):
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=127, stdout="", stderr="Command not found: glab",
+        )
+        with patch("vibe_check._run", return_value=mock_result):
+            with pytest.raises(RuntimeError, match="glab CLI not found"):
+                _resolve_gitlab_mr_refs(
+                    "https://gitlab.example.com/group/project/-/merge_requests/12"
+                )
+
+    def test_resolve_review_target_dispatches_github(self):
+        mock_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"baseRefName":"main","headRefName":"feat/cool"}',
+            stderr="",
+        )
+        with patch("vibe_check._run", return_value=mock_result):
+            target = resolve_review_target("https://github.com/acme/widgets/pull/10")
+        assert target.provider == "github"
+        assert target.repo_url == "https://github.com/acme/widgets"
+
+    def test_resolve_review_target_rejects_unknown_url(self):
+        with pytest.raises(ValueError, match="Invalid review URL"):
+            resolve_review_target("https://example.com/repo/pull/1")
 
 
 # -- _diff_reports ------------------------------------------------------------
@@ -272,6 +343,13 @@ class TestArgparse:
             ["--pr", "https://github.com/org/repo/pull/5"]
         )
         assert args.pr == "https://github.com/org/repo/pull/5"
+
+    def test_gitlab_mr_mode(self):
+        parser = _build_parser()
+        args = parser.parse_args(
+            ["--pr", "https://gitlab.example.com/org/repo/-/merge_requests/5"]
+        )
+        assert args.pr == "https://gitlab.example.com/org/repo/-/merge_requests/5"
 
     def test_compare_mode(self):
         parser = _build_parser()

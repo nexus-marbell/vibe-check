@@ -27,12 +27,12 @@ RUN pip install --no-cache-dir \
 
 # Pyright (Node.js-based type checker) + TypeScript analysis tools
 RUN npm install -g \
-    pyright \
-    eslint \
-    typescript \
-    jscpd \
-    @typescript-eslint/parser \
-    @typescript-eslint/eslint-plugin
+    pyright@1.1.409 \
+    eslint@8.57.1 \
+    typescript@6.0.3 \
+    jscpd@4.2.3 \
+    @typescript-eslint/parser@7.18.0 \
+    @typescript-eslint/eslint-plugin@7.18.0
 
 # Create workspace directory for cloned repos
 RUN mkdir /workspace

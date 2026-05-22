@@ -7,11 +7,15 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from vibe_check import (
+    CodebaseProfile,
     DimensionResult,
     ReportData,
+    _ensure_node_dependencies,
+    _scan_hidden_file,
     _score_to_grade,
     _score_cc,
     _score_mi,
+    build_codebase_profile,
     compute_overall,
     _check_has_readme,
     _check_has_tests,
@@ -21,6 +25,9 @@ from vibe_check import (
     _find_pyscn_json,
     _summarize_pyscn_clones,
     stage_duplication,
+    stage_hidden_code,
+    stage_java_ast,
+    stage_java_semantics,
 )
 
 
@@ -121,6 +128,31 @@ class TestLanguageDetection:
         langs = detect_languages(tmp_path)
         assert "python" in langs
 
+    def test_detects_java_maven(self, tmp_path):
+        (tmp_path / "pom.xml").write_text("<project></project>")
+        langs = detect_languages(tmp_path)
+        assert "java" in langs
+
+    def test_detects_java_gradle(self, tmp_path):
+        (tmp_path / "build.gradle.kts").write_text("plugins { java }")
+        langs = detect_languages(tmp_path)
+        assert "java" in langs
+
+    def test_detects_java_source_tree(self, tmp_path):
+        source = tmp_path / "src" / "main" / "java" / "App.java"
+        source.parent.mkdir(parents=True)
+        source.write_text("class App {}")
+        langs = detect_languages(tmp_path)
+        assert "java" in langs
+
+    def test_builds_codebase_profile_tool_plan(self, tmp_path):
+        (tmp_path / "pom.xml").write_text("<project></project>")
+        profile = build_codebase_profile(tmp_path)
+        assert isinstance(profile, CodebaseProfile)
+        assert profile.languages == {"java"}
+        assert "java-ast" in profile.tool_plan
+        assert "hidden-code" in profile.tool_plan
+
 
 class TestHygieneHelpers:
     def test_has_readme(self, tmp_path):
@@ -140,6 +172,12 @@ class TestHygieneHelpers:
 
     def test_has_test_files(self, tmp_path):
         (tmp_path / "test_foo.py").write_text("pass")
+        assert _check_has_tests(tmp_path)
+
+    def test_has_java_test_files(self, tmp_path):
+        source = tmp_path / "src" / "test" / "java" / "AppTest.java"
+        source.parent.mkdir(parents=True)
+        source.write_text("class AppTest {}")
         assert _check_has_tests(tmp_path)
 
     def test_no_tests(self, tmp_path):
@@ -301,3 +339,63 @@ class TestPyscnDuplicationStage:
         assert dim.score == 50
         assert dim.grade == "?"
         assert any("duplication_score missing" in err for err in report.tool_errors)
+
+
+class TestHiddenCodeStage:
+    def test_scan_hidden_file_detects_invisible_and_sink(self, tmp_path):
+        source = tmp_path / "bad.py"
+        source.write_text("payload = 'x\u200b'\neval(payload)\n")
+        invisibles, sinks = _scan_hidden_file(source)
+        assert invisibles["zero-width space"] == 1
+        assert "python eval()" in sinks
+
+    def test_stage_hidden_code_auto_f_for_combined_pattern(self, tmp_path):
+        (tmp_path / "bad.js").write_text("const x = 'a\u200b'; eval(x);")
+        report = ReportData()
+        stage_hidden_code(tmp_path, report)
+        compute_overall(report)
+        dim = next(d for d in report.dimensions if d.name == "Hidden Code")
+        assert dim.grade == "F"
+        assert report.overall_grade == "F"
+        assert report.overall_score <= 20
+        assert any("Invisible Unicode plus execution sink" in t for t in report.auto_f_triggers)
+
+    def test_stage_hidden_code_clean_repo_scores_a(self, tmp_path):
+        (tmp_path / "ok.java").write_text("class Ok { void run() {} }")
+        report = ReportData()
+        stage_hidden_code(tmp_path, report)
+        dim = next(d for d in report.dimensions if d.name == "Hidden Code")
+        assert dim.grade == "A"
+        assert report.auto_f_triggers == []
+
+
+class TestJavaStages:
+    def test_java_ast_counts_types_methods_and_risks(self, tmp_path):
+        source = tmp_path / "src" / "main" / "java" / "App.java"
+        source.parent.mkdir(parents=True)
+        source.write_text(
+            "class App { public void run() { Runtime.getRuntime().exec(\"x\"); } }"
+        )
+        report = ReportData()
+        stage_java_ast(tmp_path, report)
+        dim = next(d for d in report.dimensions if d.name == "Java AST")
+        assert "1 files" in dim.raw_value
+        assert "1 types" in dim.raw_value
+        assert "1 high-risk files" in dim.raw_value
+        assert report.risk_flags
+
+    def test_java_semantics_skips_without_build_file(self, tmp_path):
+        (tmp_path / "App.java").write_text("class App {}")
+        report = ReportData()
+        stage_java_semantics(tmp_path, report)
+        dim = next(d for d in report.dimensions if d.name == "Type Safety")
+        assert dim.grade == "?"
+        assert any("no Maven or Gradle" in err for err in report.tool_errors)
+
+
+class TestTypeScriptDependencyPrep:
+    def test_missing_node_modules_without_lock_skips_tsc(self, tmp_path):
+        (tmp_path / "package.json").write_text("{}")
+        report = ReportData()
+        assert not _ensure_node_dependencies(tmp_path, report)
+        assert any("node_modules and npm lockfile are missing" in err for err in report.tool_errors)

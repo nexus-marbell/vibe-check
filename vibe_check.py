@@ -19,11 +19,13 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote, urlparse
 
 _TOOL_TIMEOUT = 120
 _WORKSPACE = Path("/workspace")
@@ -46,6 +48,22 @@ class HotspotEntry:
     function: str
     cc: int
     mi: float
+
+
+@dataclass
+class CodebaseProfile:
+    languages: set[str] = field(default_factory=set)
+    markers: list[str] = field(default_factory=list)
+    tool_plan: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ReviewTarget:
+    provider: str
+    repo_url: str
+    base_ref: str
+    head_ref: str
+    repo_slug: str
 
 
 @dataclass
@@ -98,7 +116,66 @@ def _score_to_grade(score: float) -> str:
     return "F"
 
 
+def _dim_unavailable(report: ReportData, name: str, raw_value: str, error: str) -> None:
+    """Append a neutral unavailable dimension and preserve the tool failure."""
+    report.tool_errors.append(error)
+    report.dimensions.append(DimensionResult(name, raw_value, "?", 50))
+
+
+def _score_issue_count(count: int) -> float:
+    if count == 0:
+        return 100
+    if count <= 5:
+        return 90
+    if count <= 20:
+        return 75
+    if count <= 50:
+        return 60
+    if count <= 100:
+        return 40
+    return max(10, 40 - (count - 100) // 10)
+
+
+def _score_error_warning_count(errors: int, warnings: int) -> float:
+    total = errors + warnings
+    if total == 0:
+        return 100
+    if errors == 0 and warnings <= 10:
+        return 90
+    if errors <= 5:
+        return 75
+    if errors <= 20:
+        return 60
+    if errors <= 50:
+        return 40
+    return max(10, 40 - (errors - 50) // 5)
+
+
 # -- Language Detection --------------------------------------------------------
+
+_IGNORED_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".pyscn",
+    ".wily",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    "__pycache__",
+}
+
+
+def _is_ignored_path(path: Path) -> bool:
+    return any(part in _IGNORED_DIRS for part in path.parts)
+
+
+def _source_files(repo: Path, suffixes: tuple[str, ...]) -> list[Path]:
+    files: list[Path] = []
+    for suffix in suffixes:
+        files.extend(f for f in repo.rglob(f"*{suffix}") if not _is_ignored_path(f))
+    return files
 
 
 def _has_python_markers(repo: Path) -> bool:
@@ -108,12 +185,7 @@ def _has_python_markers(repo: Path) -> bool:
         if (repo / marker).exists():
             return True
 
-    py_files = [
-        f
-        for f in repo.rglob("*.py")
-        if ".git" not in f.parts and "node_modules" not in f.parts
-    ]
-    return len(py_files) > 0
+    return len(_source_files(repo, (".py",))) > 0
 
 
 def _has_typescript_markers(repo: Path) -> bool:
@@ -124,29 +196,57 @@ def _has_typescript_markers(repo: Path) -> bool:
     if (repo / "package.json").exists():
         return True
 
-    ts_files = [
-        f
-        for f in list(repo.rglob("*.ts")) + list(repo.rglob("*.tsx"))
-        if ".git" not in f.parts and "node_modules" not in f.parts
+    return len(_source_files(repo, (".ts", ".tsx"))) > 0
+
+
+def _has_java_markers(repo: Path) -> bool:
+    """Check for Java project markers or .java source files."""
+    java_markers = [
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
     ]
-    return len(ts_files) > 0
+    for marker in java_markers:
+        if (repo / marker).exists():
+            return True
+    if (repo / "src" / "main" / "java").is_dir():
+        return True
+    return len(_source_files(repo, (".java",))) > 0
+
+
+def build_codebase_profile(repo: Path) -> CodebaseProfile:
+    """Detect languages and build the tool plan used by repo and PR/MR modes."""
+    profile = CodebaseProfile()
+
+    if _has_python_markers(repo):
+        profile.languages.add("python")
+        profile.markers.append("python")
+        profile.tool_plan.extend(["ruff", "pyright", "pyscn"])
+
+    if _has_typescript_markers(repo):
+        profile.languages.add("typescript")
+        profile.markers.append("typescript")
+        profile.tool_plan.extend(["eslint", "tsc", "jscpd"])
+
+    if _has_java_markers(repo):
+        profile.languages.add("java")
+        profile.markers.append("java")
+        profile.tool_plan.extend(["java-ast", "java-build", "lizard"])
+
+    profile.tool_plan.extend(["lizard", "hygiene", "hidden-code"])
+    profile.tool_plan = list(dict.fromkeys(profile.tool_plan))
+    return profile
 
 
 def detect_languages(repo: Path) -> set[str]:
     """Detect programming languages in a repository.
 
-    Checks for Python and TypeScript marker files.
-    Returns a set containing "python", "typescript", or both.
+    Returns a set containing detected languages such as "python",
+    "typescript", and "java".
     """
-    languages: set[str] = set()
-
-    if _has_python_markers(repo):
-        languages.add("python")
-
-    if _has_typescript_markers(repo):
-        languages.add("typescript")
-
-    return languages
+    return build_codebase_profile(repo).languages
 
 
 # -- Stage: Clone / Identify ---------------------------------------------------
@@ -225,6 +325,144 @@ def stage_ruff(repo: Path, report: ReportData) -> None:
     )
     if count > 50:
         report.risk_flags.append(f"High lint issue count ({count})")
+
+
+# -- Stage: Hidden Code -------------------------------------------------------
+
+_INVISIBLE_RANGES = (
+    (0xFE00, 0xFE0F, "variation selector"),
+    (0xE0100, 0xE01EF, "variation selector supplement"),
+    (0xE0001, 0xE007F, "tag character"),
+    (0x2061, 0x2064, "invisible operator"),
+)
+
+_INVISIBLE_CHARS = {
+    0x00AD: "soft hyphen",
+    0x180E: "mongolian vowel separator",
+    0x200B: "zero-width space",
+    0x200C: "zero-width non-joiner",
+    0x200D: "zero-width joiner",
+    0x2060: "word joiner",
+}
+
+_SOURCE_SUFFIXES = (
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".java",
+    ".kt",
+    ".kts",
+    ".go",
+    ".rs",
+    ".rb",
+    ".php",
+    ".cs",
+    ".cpp",
+    ".c",
+    ".h",
+    ".hpp",
+)
+
+_SINK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("python eval()", re.compile(r"\beval\s*\(")),
+    ("python exec()", re.compile(r"\bexec\s*\(")),
+    ("python compile()", re.compile(r"\bcompile\s*\(")),
+    ("js Function()", re.compile(r"\b(?:new\s+)?Function\s*\(")),
+    ("js eval()", re.compile(r"\beval\s*\(")),
+    (
+        "js string timer",
+        re.compile(r"\bset(?:Timeout|Interval)\s*\(\s*(['\"])", re.MULTILINE),
+    ),
+    (
+        "java script engine eval",
+        re.compile(r"\b(?:ScriptEngine|engine)\s*\.\s*eval\s*\("),
+    ),
+    (
+        "shell execution",
+        re.compile(r"\b(?:subprocess|Runtime\.getRuntime\(\)\.exec|ProcessBuilder)\b"),
+    ),
+)
+
+
+def _invisible_category(char: str, index: int) -> str | None:
+    codepoint = ord(char)
+    if codepoint == 0xFEFF and index != 0:
+        return "misplaced BOM"
+    if codepoint in _INVISIBLE_CHARS:
+        return _INVISIBLE_CHARS[codepoint]
+    for start, end, label in _INVISIBLE_RANGES:
+        if start <= codepoint <= end:
+            return label
+    return None
+
+
+def _source_scan_files(repo: Path) -> list[Path]:
+    return [f for f in _source_files(repo, _SOURCE_SUFFIXES) if f.is_file()]
+
+
+def _scan_hidden_file(path: Path) -> tuple[dict[str, int], list[str]]:
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return {}, []
+
+    invisible_counts: dict[str, int] = {}
+    for index, char in enumerate(text):
+        category = _invisible_category(char, index)
+        if category:
+            invisible_counts[category] = invisible_counts.get(category, 0) + 1
+
+    sinks = [name for name, pattern in _SINK_PATTERNS if pattern.search(text)]
+    return invisible_counts, sinks
+
+
+def stage_hidden_code(repo: Path, report: ReportData) -> None:
+    """Detect invisible Unicode plus dynamic execution sinks."""
+    invisible_files: list[Path] = []
+    sink_files: list[Path] = []
+    critical_files: list[Path] = []
+    invisible_total = 0
+    sink_total = 0
+
+    for path in _source_scan_files(repo):
+        invisibles, sinks = _scan_hidden_file(path)
+        if invisibles:
+            invisible_files.append(path)
+            invisible_total += sum(invisibles.values())
+        if sinks:
+            sink_files.append(path)
+            sink_total += len(sinks)
+        if invisibles and sinks:
+            critical_files.append(path)
+
+    penalty = len(invisible_files) * 5 + sink_total * 3
+    score = max(0, 100 - penalty)
+    if critical_files:
+        score = min(score, 20)
+
+    raw_value = (
+        f"{len(invisible_files)} files with invisible Unicode, "
+        f"{sink_total} execution sink{'s' if sink_total != 1 else ''}"
+    )
+    report.dimensions.append(
+        DimensionResult("Hidden Code", raw_value, _score_to_grade(score), score)
+    )
+
+    if invisible_files:
+        report.risk_flags.append(
+            f"Invisible Unicode found in {len(invisible_files)} source file(s)"
+        )
+    if sink_files:
+        report.risk_flags.append(
+            f"Dynamic execution sinks found in {len(sink_files)} source file(s)"
+        )
+    if critical_files:
+        names = ", ".join(sorted({p.name for p in critical_files[:5]}))
+        report.auto_f_triggers.append(
+            f"Invisible Unicode plus execution sink in same file ({names})"
+        )
 
 
 # -- Stage: Pyright ------------------------------------------------------------
@@ -637,29 +875,67 @@ def stage_eslint(repo: Path, report: ReportData) -> None:
         data = []
         report.tool_errors.append("eslint: JSON parse error")
 
+    if result.returncode != 0 and not data:
+        message = (result.stderr or result.stdout).strip().splitlines()
+        detail = message[0] if message else f"exit {result.returncode}"
+        _dim_unavailable(report, "Linting", "failed", f"eslint: {detail[:160]}")
+        return
+
     count = 0
+    fatal_count = 0
     for file_result in data:
         if isinstance(file_result, dict):
             count += file_result.get("errorCount", 0)
+            fatal_count += file_result.get("fatalErrorCount", 0)
 
-    if count == 0:
-        score = 100
-    elif count <= 5:
-        score = 90
-    elif count <= 20:
-        score = 75
-    elif count <= 50:
-        score = 60
-    elif count <= 100:
-        score = 40
-    else:
-        score = max(10, 40 - (count - 100) // 10)
+    score = _score_issue_count(count)
 
     report.dimensions.append(
         DimensionResult("Linting", f"{count} issues", _score_to_grade(score), score)
     )
+    if result.returncode != 0 or fatal_count:
+        report.tool_errors.append(
+            f"eslint: exited {result.returncode} with {fatal_count} fatal errors"
+        )
     if count > 50:
         report.risk_flags.append(f"High lint issue count ({count})")
+
+
+# -- Stage: TypeScript dependency preparation ---------------------------------
+
+
+def _ensure_node_dependencies(repo: Path, report: ReportData) -> bool:
+    """Install TypeScript dependencies only when a reproducible lockfile exists."""
+    if not (repo / "package.json").exists():
+        return True
+    if (repo / "node_modules").exists():
+        return True
+
+    if (repo / "package-lock.json").exists() or (repo / "npm-shrinkwrap.json").exists():
+        result = _run(["npm", "ci", "--ignore-scripts"], cwd=repo)
+        if result.returncode == 0:
+            return True
+        report.tool_errors.append(
+            "npm ci: failed; TypeScript type check skipped "
+            f"({(result.stderr or result.stdout).strip()[:160]})"
+        )
+        return False
+
+    if (repo / "pnpm-lock.yaml").exists():
+        report.tool_errors.append(
+            "tsc: pnpm lockfile present but pnpm install is not managed by vibe-check"
+        )
+        return False
+    if (repo / "yarn.lock").exists():
+        report.tool_errors.append(
+            "tsc: yarn lockfile present but yarn install is not managed by vibe-check"
+        )
+        return False
+
+    report.tool_errors.append(
+        "tsc: package.json present but node_modules and npm lockfile are missing"
+    )
+    return False
 
 
 # -- Stage: tsc (TypeScript type checking) ------------------------------------
@@ -667,13 +943,18 @@ def stage_eslint(repo: Path, report: ReportData) -> None:
 
 def stage_tsc(repo: Path, report: ReportData) -> None:
     """Run tsc --noEmit for type checking. Count errors."""
+    if not _ensure_node_dependencies(repo, report):
+        report.dimensions.append(
+            DimensionResult("Type Safety", "deps unavailable", "?", 50)
+        )
+        return
+
     has_tsconfig = (repo / "tsconfig.json").exists()
     if has_tsconfig:
         cmd = ["tsc", "--noEmit", "--project", str(repo / "tsconfig.json")]
     else:
         # No tsconfig: check all TS files with permissive settings
-        ts_files = list(repo.rglob("*.ts")) + list(repo.rglob("*.tsx"))
-        ts_files = [str(f) for f in ts_files if "node_modules" not in f.parts]
+        ts_files = [str(f) for f in _source_files(repo, (".ts", ".tsx"))]
         if not ts_files:
             report.dimensions.append(
                 DimensionResult("Type Safety", "no .ts files found", "?", 50)
@@ -699,19 +980,13 @@ def stage_tsc(repo: Path, report: ReportData) -> None:
         elif warning_pattern.search(line):
             warnings += 1
 
-    total = errors + warnings
-    if total == 0:
-        score = 100
-    elif errors == 0 and warnings <= 10:
-        score = 90
-    elif errors <= 5:
-        score = 75
-    elif errors <= 20:
-        score = 60
-    elif errors <= 50:
-        score = 40
-    else:
-        score = max(10, 40 - (errors - 50) // 5)
+    if result.returncode != 0 and errors == 0 and warnings == 0:
+        message = (result.stderr or result.stdout).strip().splitlines()
+        detail = message[0] if message else f"exit {result.returncode}"
+        _dim_unavailable(report, "Type Safety", "failed", f"tsc: {detail[:160]}")
+        return
+
+    score = _score_error_warning_count(errors, warnings)
 
     report.dimensions.append(
         DimensionResult(
@@ -723,6 +998,142 @@ def stage_tsc(repo: Path, report: ReportData) -> None:
     )
     if errors > 20:
         report.risk_flags.append(f"High type error count ({errors})")
+
+
+# -- Stage: Java --------------------------------------------------------------
+
+_JAVA_CLASS_PATTERN = re.compile(
+    r"\b(?:class|interface|enum|record)\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+_JAVA_METHOD_PATTERN = re.compile(
+    r"(?:public|protected|private|static|final|synchronized|native|\s)+"
+    r"[A-Za-z_][A-Za-z0-9_<>\[\], ?]*\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*(?:throws\s+[^{]+)?\{"
+)
+_JAVA_HIGH_RISK_PATTERN = re.compile(
+    r"\b(?:System\.exit|Runtime\.getRuntime\(\)\.exec|ProcessBuilder|"
+    r"Class\.forName|setAccessible\s*\(|ScriptEngine|Unsafe)\b"
+)
+
+
+def _java_files(repo: Path) -> list[Path]:
+    return _source_files(repo, (".java",))
+
+
+def stage_java_ast(repo: Path, report: ReportData) -> None:
+    """Parse Java source structure and flag high-risk constructs."""
+    java_files = _java_files(repo)
+    if not java_files:
+        report.dimensions.append(DimensionResult("Java AST", "no .java files", "?", 50))
+        return
+
+    class_count = 0
+    method_count = 0
+    risky_files: list[str] = []
+
+    for path in java_files:
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        class_count += len(_JAVA_CLASS_PATTERN.findall(text))
+        method_count += len(_JAVA_METHOD_PATTERN.findall(text))
+        if _JAVA_HIGH_RISK_PATTERN.search(text):
+            risky_files.append(str(path.relative_to(repo)))
+
+    risk_count = len(risky_files)
+    score = max(30, 100 - risk_count * 15)
+    raw_value = (
+        f"{len(java_files)} files, {class_count} types, "
+        f"{method_count} methods, {risk_count} high-risk files"
+    )
+    report.dimensions.append(
+        DimensionResult("Java AST", raw_value, _score_to_grade(score), score)
+    )
+    if risk_count:
+        report.risk_flags.append(
+            f"Java high-risk constructs in {risk_count} file(s): "
+            + ", ".join(risky_files[:5])
+        )
+
+
+def _java_build_command(repo: Path) -> list[str] | None:
+    if (repo / "mvnw").exists():
+        return [str(repo / "mvnw"), "-q", "-DskipTests", "compile"]
+    if (repo / "pom.xml").exists():
+        return ["mvn", "-q", "-DskipTests", "compile"]
+    if (repo / "gradlew").exists():
+        return [str(repo / "gradlew"), "classes", "--quiet"]
+    if (repo / "build.gradle").exists() or (repo / "build.gradle.kts").exists():
+        return ["gradle", "classes", "--quiet"]
+    return None
+
+
+def stage_java_semantics(repo: Path, report: ReportData) -> None:
+    """Run Java build compilation as the semantic/LSP-equivalent signal."""
+    cmd = _java_build_command(repo)
+    if cmd is None:
+        _dim_unavailable(
+            report,
+            "Type Safety",
+            "skipped",
+            "java: no Maven or Gradle build file found",
+        )
+        return
+
+    result = _run(cmd, cwd=repo)
+    if result.returncode == 127:
+        _dim_unavailable(
+            report,
+            "Type Safety",
+            "skipped",
+            f"java build: command not found: {cmd[0]}",
+        )
+        return
+    if result.returncode == 124:
+        _dim_unavailable(report, "Type Safety", "timeout", "java build: timeout")
+        return
+
+    output = result.stdout + result.stderr
+    error_lines = [
+        line
+        for line in output.splitlines()
+        if re.search(r"\b(error|compilation failure)\b", line, re.IGNORECASE)
+    ]
+    if result.returncode != 0:
+        count = max(1, len(error_lines))
+        score = _score_error_warning_count(count, 0)
+        report.dimensions.append(
+            DimensionResult(
+                "Type Safety",
+                f"compile failed ({count} diagnostic lines)",
+                _score_to_grade(score),
+                score,
+            )
+        )
+        report.risk_flags.append("Java compile failed")
+        return
+
+    report.dimensions.append(
+        DimensionResult("Type Safety", "java compile passed", "A", 100)
+    )
+
+
+def stage_java_lsp(repo: Path, report: ReportData) -> None:
+    """Probe for Java LSP availability; compile remains the semantic fallback."""
+    if not _java_files(repo):
+        return
+    if shutil.which("jdtls") is None:
+        report.tool_errors.append(
+            "java lsp: jdtls not installed; using Maven/Gradle compile as semantic fallback"
+        )
+        report.dimensions.append(DimensionResult("Java LSP", "jdtls unavailable", "?", 50))
+        return
+    result = _run(["jdtls", "--version"], cwd=repo)
+    if result.returncode in (0, 1):
+        report.dimensions.append(DimensionResult("Java LSP", "jdtls available", "A", 100))
+    else:
+        _dim_unavailable(report, "Java LSP", "failed", "java lsp: jdtls probe failed")
 
 
 # -- Stage: jscpd (TypeScript duplication) ------------------------------------
@@ -877,10 +1288,10 @@ def _check_has_tests(repo: Path) -> bool:
         list(repo.rglob("test_*.py"))
         + list(repo.rglob("*.test.ts"))
         + list(repo.rglob("*.spec.ts"))
+        + list(repo.rglob("*Test.java"))
+        + list(repo.rglob("*Tests.java"))
     )
-    test_files = [
-        f for f in test_files if ".git" not in f.parts and "node_modules" not in f.parts
-    ]
+    test_files = [f for f in test_files if not _is_ignored_path(f)]
     return len(test_files) > 0
 
 
@@ -902,10 +1313,10 @@ _SECRET_PATTERN = re.compile(
 
 def _scan_for_secrets(repo: Path) -> bool:
     """Scan source files for potential hardcoded secrets."""
-    globs = ("*.py", "*.ts", "*.js", "*.env")
+    globs = ("*.py", "*.ts", "*.js", "*.java", "*.kt", "*.env")
     for pattern in globs:
         for filepath in repo.rglob(pattern):
-            if ".git" in filepath.parts or "node_modules" in filepath.parts:
+            if _is_ignored_path(filepath):
                 continue
             try:
                 content = filepath.read_text(errors="replace")
@@ -970,6 +1381,8 @@ _WEIGHTS = {
     "Complexity": 0.25,
     "Duplication": 0.15,
     "Hygiene": 0.15,
+    "Java AST": 0.10,
+    "Hidden Code": 0.20,
 }
 
 
@@ -1009,7 +1422,8 @@ def compute_overall(report: ReportData) -> None:
     # Auto-F override
     if report.auto_f_triggers:
         report.overall_grade = "F"
-        report.overall_score = min(report.overall_score, 39)
+        cap = 20 if any("Invisible Unicode" in t for t in report.auto_f_triggers) else 39
+        report.overall_score = min(report.overall_score, cap)
     else:
         report.overall_grade = _score_to_grade(report.overall_score)
 
@@ -1110,14 +1524,14 @@ def _run_analysis(repo_path: Path, repo_name: str, commit_sha: str, commit_date:
         commit_date=commit_date,
     )
 
-    languages = detect_languages(repo_path)
+    profile = build_codebase_profile(repo_path)
+    languages = profile.languages
     if not languages:
         print(
-            "WARNING: No Python or TypeScript files detected. "
-            "Running Python toolchain as fallback.",
+            "WARNING: No supported language markers detected. "
+            "Running generic complexity, hygiene, and hidden-code checks.",
             file=sys.stderr,
         )
-        languages = {"python"}
 
     if "python" in languages:
         stage_ruff(repo_path, report)
@@ -1128,8 +1542,13 @@ def _run_analysis(repo_path: Path, repo_name: str, commit_sha: str, commit_date:
         stage_pyright(repo_path, report)
     if "typescript" in languages:
         stage_tsc(repo_path, report)
+    if "java" in languages:
+        stage_java_lsp(repo_path, report)
+        stage_java_semantics(repo_path, report)
 
     stage_complexity(repo_path, report)
+    if "java" in languages:
+        stage_java_ast(repo_path, report)
 
     if "python" in languages:
         stage_health(repo_path, report)
@@ -1141,6 +1560,7 @@ def _run_analysis(repo_path: Path, repo_name: str, commit_sha: str, commit_date:
 
     stage_wily(repo_path, report)
     stage_hygiene(repo_path, report)
+    stage_hidden_code(repo_path, report)
     compute_overall(report)
 
     return report
@@ -1262,7 +1682,7 @@ def _diff_reports(base: ReportData, head: ReportData) -> str:
     return "\n".join(lines)
 
 
-# -- PR URL parsing -----------------------------------------------------------
+# -- PR/MR URL parsing --------------------------------------------------------
 
 
 def _parse_pr_url(url: str) -> tuple[str, str, int]:
@@ -1285,12 +1705,26 @@ def _parse_pr_url(url: str) -> tuple[str, str, int]:
     return match.group(1), match.group(2), int(match.group(3))
 
 
-def _resolve_pr_refs(pr_url: str) -> tuple[str, str, str, str]:
-    """Resolve a PR URL to (repo_url, base_ref, head_ref, repo_slug).
+def _parse_gitlab_mr_url(url: str) -> tuple[str, str, int]:
+    """Extract host, project path, and MR IID from a GitLab MR URL."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            f"Invalid GitLab MR URL: {url}\n"
+            "Expected format: https://gitlab.example.com/group/project/-/merge_requests/123"
+        )
+    match = re.match(r"^/(.+)/-/merge_requests/(\d+)", parsed.path)
+    if not match:
+        raise ValueError(
+            f"Invalid GitLab MR URL: {url}\n"
+            "Expected format: https://gitlab.example.com/group/project/-/merge_requests/123"
+        )
+    project_path = match.group(1).strip("/")
+    return parsed.netloc, project_path, int(match.group(2))
 
-    Uses `gh pr view` to get the base and head ref names.
-    Raises RuntimeError if `gh` is not available or the command fails.
-    """
+
+def _resolve_github_pr_refs(pr_url: str) -> ReviewTarget:
+    """Resolve a GitHub PR URL to a provider-neutral review target."""
     owner, repo, number = _parse_pr_url(pr_url)
     repo_slug = f"{owner}/{repo}"
 
@@ -1326,8 +1760,77 @@ def _resolve_pr_refs(pr_url: str) -> tuple[str, str, str, str]:
             f"gh returned: {data}"
         )
 
-    repo_url = f"https://github.com/{repo_slug}"
-    return repo_url, base_ref, head_ref, repo_slug
+    return ReviewTarget(
+        provider="github",
+        repo_url=f"https://github.com/{repo_slug}",
+        base_ref=base_ref,
+        head_ref=head_ref,
+        repo_slug=repo_slug,
+    )
+
+
+def _resolve_gitlab_mr_refs(mr_url: str) -> ReviewTarget:
+    """Resolve a GitLab MR URL to a provider-neutral review target."""
+    host, project_path, iid = _parse_gitlab_mr_url(mr_url)
+    encoded_project = quote(project_path, safe="")
+    result = _run(
+        [
+            "glab",
+            "api",
+            "--hostname",
+            host,
+            f"projects/{encoded_project}/merge_requests/{iid}",
+        ]
+    )
+    if result.returncode == 127:
+        raise RuntimeError(
+            "glab CLI not found. Install it from https://gitlab.com/gitlab-org/cli "
+            "or use --compare BASE_REF...HEAD_REF instead."
+        )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"glab api failed for {host}/{project_path}!{iid}: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse glab output: {exc}") from exc
+
+    base_ref = data.get("target_branch", "")
+    head_ref = data.get("source_branch", "")
+    if not base_ref or not head_ref:
+        raise RuntimeError(
+            f"Could not determine refs for {host}/{project_path}!{iid}. "
+            f"glab returned: {data}"
+        )
+
+    return ReviewTarget(
+        provider="gitlab",
+        repo_url=f"https://{host}/{project_path}.git",
+        base_ref=base_ref,
+        head_ref=head_ref,
+        repo_slug=f"{host}/{project_path}",
+    )
+
+
+def resolve_review_target(url: str) -> ReviewTarget:
+    """Resolve a GitHub PR or GitLab MR URL to a common analysis target."""
+    if re.match(r"https?://github\.com/[^/]+/[^/]+/pull/\d+", url):
+        return _resolve_github_pr_refs(url)
+    if "/-/merge_requests/" in url:
+        return _resolve_gitlab_mr_refs(url)
+    raise ValueError(
+        f"Invalid review URL: {url}\n"
+        "Expected a GitHub PR URL or GitLab MR URL."
+    )
+
+
+def _resolve_pr_refs(pr_url: str) -> tuple[str, str, str, str]:
+    """Backward-compatible wrapper returning (repo_url, base_ref, head_ref, slug)."""
+    target = _resolve_github_pr_refs(pr_url)
+    return target.repo_url, target.base_ref, target.head_ref, target.repo_slug
 
 
 # -- Comparison mode ----------------------------------------------------------
@@ -1414,7 +1917,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pr",
         metavar="PR_URL",
-        help="GitHub PR URL to analyze (e.g., https://github.com/org/repo/pull/123).",
+        help="GitHub PR or GitLab MR URL to analyze.",
     )
     parser.add_argument(
         "--compare",
@@ -1434,12 +1937,17 @@ def main() -> None:
     # PR mode
     if args.pr:
         try:
-            repo_url, base_ref, head_ref, repo_slug = _resolve_pr_refs(args.pr)
+            review_target = resolve_review_target(args.pr)
         except (ValueError, RuntimeError) as exc:
             print(f"FATAL: {exc}", file=sys.stderr)
             sys.exit(1)
         try:
-            compare_refs(repo_url, base_ref, head_ref, repo_slug)
+            compare_refs(
+                review_target.repo_url,
+                review_target.base_ref,
+                review_target.head_ref,
+                review_target.repo_slug,
+            )
         except RuntimeError as exc:
             print(f"FATAL: {exc}", file=sys.stderr)
             sys.exit(1)

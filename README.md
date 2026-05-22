@@ -33,6 +33,9 @@ docker run --rm -v /path/to/repo:/workspace vibe-check /workspace
 # Automatic — pass a GitHub PR URL (requires gh CLI)
 docker run --rm vibe-check --pr https://github.com/org/repo/pull/123
 
+# Automatic — pass a GitLab MR URL (requires glab CLI in local mode)
+python vibe_check.py --pr https://gitlab.example.com/group/repo/-/merge_requests/123
+
 # Manual — specify base and head refs
 docker run --rm vibe-check --compare main...feature-branch https://github.com/org/repo
 
@@ -40,7 +43,7 @@ docker run --rm vibe-check --compare main...feature-branch https://github.com/or
 docker run --rm -v $(pwd):/workspace vibe-check --compare main...feature-branch /workspace
 ```
 
-PR mode checks out both refs, runs full analysis on each, and outputs a delta report:
+PR/MR mode resolves the provider refs, checks out both refs, runs full analysis on each, and outputs a delta report:
 
 ```
 # vibe-check: PR Delta — repo-name
@@ -79,21 +82,22 @@ Missing tools are skipped gracefully. Docker is the intended workflow — all to
 
 ## What it runs
 
-| Stage | Python tool | TypeScript tool | What it measures |
-|-------|-------------|-----------------|------------------|
-| Lint | ruff | eslint | Style and correctness issues |
-| Types | pyright | tsc --noEmit | Type safety errors |
-| Complexity | lizard + radon | lizard | Cyclomatic complexity, maintainability index |
-| Health | pyscn | — | Codebase health (dead code, cohesion, coupling) |
-| Duplication | pyscn (APTED) | jscpd | Structural code duplication |
-| Hygiene | built-in | built-in | License, tests, README, .gitignore, secrets |
-| History | wily | — | Complexity trends over git history |
+| Stage | Python tool | TypeScript tool | Java tool | What it measures |
+|-------|-------------|-----------------|-----------|------------------|
+| Lint | ruff | eslint | — | Style and correctness issues |
+| Types | pyright | tsc --noEmit | Maven/Gradle compile | Type/compile errors |
+| Complexity | lizard + radon | lizard | lizard | Cyclomatic complexity, maintainability index where available |
+| Health | pyscn | — | built-in Java structure scan | Codebase health, structure, high-risk constructs |
+| Duplication | pyscn (APTED) | jscpd | — | Structural code duplication |
+| Hidden Code | built-in | built-in | built-in | Invisible Unicode plus dynamic execution sinks |
+| Hygiene | built-in | built-in | built-in | License, tests, README, .gitignore, secrets |
+| History | wily | — | — | Complexity trends over git history |
 
-Language is auto-detected from project markers (`pyproject.toml`, `tsconfig.json`, file extensions). Mixed-language repos run both toolchains.
+Language is auto-detected from project markers (`pyproject.toml`, `tsconfig.json`, `package.json`, `pom.xml`, Gradle files, `src/main/java`, and file extensions). Mixed-language repos run every matching toolchain. Java analysis is honest about tool availability: `jdtls` is reported when unavailable, and Maven/Gradle compile is used as the semantic fallback.
 
 ### Beyond Python and TypeScript
 
-Lizard supports complexity analysis for many languages: **Rust, C, C++, Java, Go, Ruby, Swift, Objective-C, Scala, Lua**, and others. For repos in these languages, vibe-check still produces useful results -- complexity hotspots, hygiene checks, and duplication detection all work. Linting and type safety stages are skipped (no ruff/pyright/eslint/tsc), so those dimensions score neutral.
+Lizard supports complexity analysis for many languages: **Rust, C, C++, Java, Go, Ruby, Swift, Objective-C, Scala, Lua**, and others. For repos in these languages, vibe-check still produces useful results -- complexity hotspots, hygiene checks, hidden-code detection, and duplication detection where a language-specific tool exists. Unsupported lint/type stages are skipped as `?`, not treated as clean passes or real failures.
 
 This means vibe-check can grade any repo, not just Python/TypeScript. The complexity and hygiene dimensions alone catch god-functions, missing licenses, and hardcoded secrets regardless of language.
 
@@ -116,6 +120,7 @@ Any of these force the overall grade to F regardless of other scores:
 
 - No license file (legal risk)
 - Potential hardcoded secrets detected
+- Invisible Unicode plus an execution sink in the same file
 - Any function with cyclomatic complexity > 50
 - Code duplication > 60%
 
