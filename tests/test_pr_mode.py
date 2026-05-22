@@ -91,10 +91,10 @@ class TestParseGitLabMrUrl:
 
     def test_nested_project_url(self):
         host, project, iid = _parse_gitlab_mr_url(
-            "https://gitlab.ideoon.ch/ideoon/platform/shop/-/merge_requests/49"
+            "https://gitlab.example.com/group/platform/shop/-/merge_requests/49"
         )
-        assert host == "gitlab.ideoon.ch"
-        assert project == "ideoon/platform/shop"
+        assert host == "gitlab.example.com"
+        assert project == "group/platform/shop"
         assert iid == 49
 
     def test_invalid_gitlab_url_raises(self):
