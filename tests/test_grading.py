@@ -19,6 +19,7 @@ from vibe_check import (
     compute_overall,
     _check_has_readme,
     _check_has_tests,
+    _java_build_command,
     detect_languages,
     _parse_pyscn_text,
     _parse_pyscn_json,
@@ -370,6 +371,18 @@ class TestHiddenCodeStage:
 
 
 class TestJavaStages:
+    def test_java_build_command_uses_gradle_wrapper(self, tmp_path):
+        wrapper = tmp_path / "gradlew"
+        wrapper.write_text("#!/bin/sh\n")
+        (tmp_path / "build.gradle.kts").write_text("plugins { java }")
+
+        assert _java_build_command(tmp_path) == [str(wrapper), "classes", "--quiet"]
+
+    def test_java_build_command_skips_bare_gradle_project(self, tmp_path):
+        (tmp_path / "build.gradle.kts").write_text("plugins { java }")
+
+        assert _java_build_command(tmp_path) is None
+
     def test_java_ast_counts_types_methods_and_risks(self, tmp_path):
         source = tmp_path / "src" / "main" / "java" / "App.java"
         source.parent.mkdir(parents=True)
@@ -390,7 +403,15 @@ class TestJavaStages:
         stage_java_semantics(tmp_path, report)
         dim = next(d for d in report.dimensions if d.name == "Type Safety")
         assert dim.grade == "?"
-        assert any("no Maven or Gradle" in err for err in report.tool_errors)
+        assert any("no Maven build file or Gradle wrapper" in err for err in report.tool_errors)
+
+    def test_java_semantics_skips_bare_gradle_project(self, tmp_path):
+        (tmp_path / "build.gradle.kts").write_text("plugins { java }")
+        report = ReportData()
+        stage_java_semantics(tmp_path, report)
+        dim = next(d for d in report.dimensions if d.name == "Type Safety")
+        assert dim.grade == "?"
+        assert any("no Maven build file or Gradle wrapper" in err for err in report.tool_errors)
 
 
 class TestTypeScriptDependencyPrep:

@@ -28,15 +28,19 @@ docker run --rm -v /path/to/repo:/workspace vibe-check /workspace
 
 # Recommended for Java repos so compiled artifacts are not written as root
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
-  -v /path/to/repo:/workspace -v vibe-check-cache:/tmp/.m2 \
+  -v /path/to/repo:/workspace \
+  -v vibe-check-maven-cache:/tmp/.m2 \
+  -v vibe-check-gradle-cache:/tmp/.gradle \
   vibe-check /workspace
 ```
 
-The Docker image includes the analysis toolchain, including OpenJDK 25 plus
-Maven/Gradle for Java compile checks. Provider CLIs and their credentials (`gh`
-for GitHub, `glab` for GitLab) are normally host-local, so use the local CLI for
-automatic PR/MR URL resolution unless you build an image that also contains
-those CLIs and credentials.
+The Docker image includes the analysis toolchain, including OpenJDK 25 and
+Maven for Java compile checks. Gradle projects are supported when they commit a
+Gradle wrapper (`gradlew`); bare Gradle projects should add a wrapper or use a
+custom image with a modern Gradle installation. Provider CLIs and their
+credentials (`gh` for GitHub, `glab` for GitLab) are normally host-local, so use
+the local CLI for automatic PR/MR URL resolution unless you build an image that
+also contains those CLIs and credentials.
 
 ### Reviewing a PR or MR
 
@@ -96,7 +100,9 @@ git clone https://gitlab.example.com/group/repo.git repo
 cd repo
 git fetch origin main feature-branch
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
-  -v "$PWD":/workspace -v vibe-check-cache:/tmp/.m2 \
+  -v "$PWD":/workspace \
+  -v vibe-check-maven-cache:/tmp/.m2 \
+  -v vibe-check-gradle-cache:/tmp/.gradle \
   vibe-check --compare origin/main...origin/feature-branch /workspace
 ```
 
