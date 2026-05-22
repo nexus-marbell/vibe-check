@@ -6,7 +6,10 @@ RUN apt-get update && \
         git \
         curl \
         ca-certificates \
-        gnupg && \
+        gnupg \
+        openjdk-25-jdk \
+        maven \
+        gradle && \
     mkdir -p /etc/apt/keyrings && \
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \

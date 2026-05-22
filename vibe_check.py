@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -84,7 +85,11 @@ class ReportData:
 # -- Helpers -------------------------------------------------------------------
 
 
-def _run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    cmd: list[str],
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run a command with timeout. Returns CompletedProcess even on failure."""
     try:
         return subprocess.run(
@@ -93,6 +98,7 @@ def _run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess
             text=True,
             timeout=_TOOL_TIMEOUT,
             cwd=cwd,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
@@ -264,12 +270,59 @@ def _inject_token(url: str) -> str:
     return url
 
 
+def _new_clone_workspace() -> Path:
+    """Return an empty, writable directory for cloning a remote repository."""
+    if (
+        _WORKSPACE.exists()
+        and os.access(_WORKSPACE, os.W_OK)
+        and not any(_WORKSPACE.iterdir())
+    ):
+        return _WORKSPACE
+    return Path(tempfile.mkdtemp(prefix="vibe-check-"))
+
+
+def _git_auth_env(url: str) -> dict[str, str]:
+    """Build non-interactive git auth env for provider-backed HTTPS clones."""
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return env
+    if parsed.netloc == "github.com":
+        return env
+    if shutil.which("glab") is None:
+        return env
+
+    script_path = Path(tempfile.mkdtemp(prefix="vibe-check-auth-")) / "askpass.sh"
+    env["VIBE_CHECK_GIT_HOST"] = parsed.netloc
+    script_path.write_text(
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        "  *Username*) printf '%s\\n' oauth2 ;;\n"
+        "  *Password*) printf 'protocol=https\\nhost=%s\\n\\n' \"$VIBE_CHECK_GIT_HOST\" | glab auth git-credential get | awk -F= '$1 == \"password\" {print $2; exit}' ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR)
+    env["GIT_ASKPASS"] = str(script_path)
+    return env
+
+
+def _trust_git_directory(repo: Path) -> None:
+    """Allow git tools to inspect mounted repos owned by another host user."""
+    _run(["git", "config", "--global", "--add", "safe.directory", str(repo)])
+
+
 def stage_clone(target: str, workspace: Path) -> tuple[Path, str, str, str]:
     """Clone repo or resolve local path. Returns (path, name, sha, date)."""
     if target.startswith(("http://", "https://", "git@")):
         repo_name = target.rstrip("/").split("/")[-1].removesuffix(".git")
         clone_url = _inject_token(target)
-        result = _run(["git", "clone", "--depth=50", clone_url, str(workspace)])
+        result = _run(
+            ["git", "clone", "--depth=50", clone_url, str(workspace)],
+            env=_git_auth_env(clone_url),
+        )
         if result.returncode != 0:
             raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
         repo_path = workspace
@@ -280,6 +333,7 @@ def stage_clone(target: str, workspace: Path) -> tuple[Path, str, str, str]:
         repo_path = local
         repo_name = local.name
 
+    _trust_git_directory(repo_path)
     log = _run(["git", "log", "-1", "--format=%H|%ci"], cwd=repo_path)
     if log.returncode == 0 and "|" in log.stdout.strip():
         sha, date = log.stdout.strip().split("|", 1)
@@ -1836,17 +1890,21 @@ def _resolve_pr_refs(pr_url: str) -> tuple[str, str, str, str]:
 # -- Comparison mode ----------------------------------------------------------
 
 
-def _checkout_ref(repo_path: Path, ref: str) -> tuple[str, str]:
+def _checkout_ref(
+    repo_path: Path,
+    ref: str,
+    env: dict[str, str] | None = None,
+) -> tuple[str, str]:
     """Checkout a git ref and return (short_sha, date)."""
-    fetch = _run(["git", "fetch", "origin", ref], cwd=repo_path)
+    fetch = _run(["git", "fetch", "origin", ref], cwd=repo_path, env=env)
     if fetch.returncode != 0:
         # Might be a local branch or tag, try checkout directly
         pass
 
-    checkout = _run(["git", "checkout", ref], cwd=repo_path)
+    checkout = _run(["git", "checkout", ref], cwd=repo_path, env=env)
     if checkout.returncode != 0:
         # Try as remote tracking branch
-        checkout = _run(["git", "checkout", f"origin/{ref}"], cwd=repo_path)
+        checkout = _run(["git", "checkout", f"origin/{ref}"], cwd=repo_path, env=env)
         if checkout.returncode != 0:
             raise RuntimeError(
                 f"Failed to checkout ref '{ref}': {checkout.stderr.strip()}"
@@ -1868,11 +1926,10 @@ def compare_refs(
     """
     is_remote = target.startswith(("http://", "https://", "git@"))
     if is_remote:
-        workspace = (
-            _WORKSPACE if _WORKSPACE.parent.exists() else Path(tempfile.mkdtemp())
-        )
+        workspace = _new_clone_workspace()
         clone_url = _inject_token(target)
-        result = _run(["git", "clone", clone_url, str(workspace)])
+        git_env = _git_auth_env(clone_url)
+        result = _run(["git", "clone", clone_url, str(workspace)], env=git_env)
         if result.returncode != 0:
             raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
         repo_path = workspace
@@ -1882,16 +1939,19 @@ def compare_refs(
         if not repo_path.is_dir():
             raise RuntimeError(f"Local path not found: {target}")
         repo_name = repo_slug or repo_path.name
+        git_env = None
+
+    _trust_git_directory(repo_path)
 
     # Analyze base ref
     print(f"Checking out base ref: {base_ref}", file=sys.stderr)
-    base_sha, base_date = _checkout_ref(repo_path, base_ref)
+    base_sha, base_date = _checkout_ref(repo_path, base_ref, env=git_env)
     print(f"Analyzing base ({base_ref} @ {base_sha})...", file=sys.stderr)
     base_report = _run_analysis(repo_path, repo_name, base_sha, base_date)
 
     # Analyze head ref
     print(f"Checking out head ref: {head_ref}", file=sys.stderr)
-    head_sha, head_date = _checkout_ref(repo_path, head_ref)
+    head_sha, head_date = _checkout_ref(repo_path, head_ref, env=git_env)
     print(f"Analyzing head ({head_ref} @ {head_sha})...", file=sys.stderr)
     head_report = _run_analysis(repo_path, repo_name, head_sha, head_date)
 
@@ -1985,9 +2045,7 @@ def main() -> None:
     target = args.target
 
     if target.startswith(("http://", "https://", "git@")):
-        workspace = (
-            _WORKSPACE if _WORKSPACE.parent.exists() else Path(tempfile.mkdtemp())
-        )
+        workspace = _new_clone_workspace()
     else:
         workspace = Path(target).resolve()
 
