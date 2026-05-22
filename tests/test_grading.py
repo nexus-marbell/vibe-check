@@ -15,6 +15,9 @@ from vibe_check import (
     _check_has_readme,
     _check_has_tests,
     detect_languages,
+    _parse_pyscn_text,
+    _parse_pyscn_json,
+    _find_pyscn_json,
 )
 
 
@@ -138,3 +141,64 @@ class TestHygieneHelpers:
 
     def test_no_tests(self, tmp_path):
         assert not _check_has_tests(tmp_path)
+
+
+class TestPyscnHealthParser:
+    """Issue #17 — distinguish parser-failed from real-zero, prefer JSON."""
+
+    def test_text_parser_extracts_score(self):
+        text = "Health Score: 84/100 (Grade: B)"
+        assert _parse_pyscn_text(text) == 84.0
+
+    def test_text_parser_returns_none_on_no_match(self):
+        # Was 0.0 before #17 fix — silent fallback masqueraded as a real F.
+        assert _parse_pyscn_text("no health line here") is None
+
+    def test_text_parser_extracts_real_zero(self):
+        # A real 0/100 score IS a valid parse — distinguish from no-match (None).
+        text = "Health Score: 0/100 (Grade: F)"
+        assert _parse_pyscn_text(text) == 0.0
+
+    def test_json_parser_reads_summary_health_score(self, tmp_path):
+        report = tmp_path / "analyze_test.json"
+        report.write_text('{"summary": {"health_score": 61, "grade": "C"}}')
+        assert _parse_pyscn_json(report) == 61.0
+
+    def test_json_parser_handles_missing_field(self, tmp_path):
+        report = tmp_path / "analyze_test.json"
+        report.write_text('{"summary": {}}')
+        assert _parse_pyscn_json(report) is None
+
+    def test_json_parser_handles_malformed_json(self, tmp_path):
+        report = tmp_path / "analyze_test.json"
+        report.write_text("not json")
+        assert _parse_pyscn_json(report) is None
+
+    def test_json_parser_handles_missing_file(self, tmp_path):
+        assert _parse_pyscn_json(tmp_path / "nonexistent.json") is None
+
+    def test_find_json_from_stdout_path(self, tmp_path):
+        report_path = tmp_path / "analyze_20260504.json"
+        report_path.write_text('{"summary": {"health_score": 75}}')
+        stdout = f"Unified JSON report generated: {report_path}\nHealth Score: 75/100"
+        found = _find_pyscn_json(stdout, tmp_path)
+        assert found == report_path
+
+    def test_find_json_falls_back_to_glob(self, tmp_path):
+        reports_dir = tmp_path / ".pyscn" / "reports"
+        reports_dir.mkdir(parents=True)
+        older = reports_dir / "analyze_20260501.json"
+        older.write_text("{}")
+        newer = reports_dir / "analyze_20260504.json"
+        newer.write_text("{}")
+        # bump newer's mtime explicitly so glob sort is deterministic
+        import os as _os
+        import time as _time
+        _os.utime(newer, (_time.time(), _time.time()))
+        _os.utime(older, (_time.time() - 100, _time.time() - 100))
+        # No path in stdout — should fall back to newest in reports dir.
+        found = _find_pyscn_json("", tmp_path)
+        assert found == newer
+
+    def test_find_json_returns_none_when_no_reports(self, tmp_path):
+        assert _find_pyscn_json("", tmp_path) is None
